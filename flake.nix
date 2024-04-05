@@ -50,7 +50,8 @@
             rust-analyzer
             protobuf
             nixpkgs-fmt
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin
+            (with pkgs.darwin.apple_sdk.frameworks; [ Security SystemConfiguration ]);
 
           # Environment variables
           env = {
