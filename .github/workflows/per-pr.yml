@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  checks:
     name: "Format, docs, and lint"
     timeout-minutes: 10
     runs-on: ubuntu-latest
@@ -64,23 +64,15 @@ jobs:
           name: state-machine-coverage
           path: machine_coverage/
 
-  fmt:
+  integ-test:
     name: Integ tests
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: 1.77.0
-          override: true
-      - name: Install protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          version: '3.x'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions-rs/cargo@v1
-        with:
-          command: integ-test
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: cargo integ-test
+        run: |
+          nix develop --command \
+            cargo integ-test
