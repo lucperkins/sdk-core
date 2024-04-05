@@ -38,7 +38,7 @@
 
       # Add custom attributes to Nixpkgs
       overlays.default = final: prev: {
-        rustToolchain = final.rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; };
+        rustToolchain = final.rust-bin.nightly.latest.default.override { extensions = [ "rust-src" ]; };
       };
 
       # Development environments
