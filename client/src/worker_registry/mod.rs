@@ -95,9 +95,11 @@ impl SlotManagerImpl {
         }
     }
 
-    fn unregister(&mut self, id: WorkerKey) {
+    fn unregister(&mut self, id: WorkerKey) -> Option<Box<dyn SlotProvider + Send + Sync>> {
         if let Some(key) = self.index.remove(id) {
-            self.providers.remove(&key);
+            self.providers.remove(&key)
+        } else {
+            None
         }
     }
 
@@ -140,7 +142,7 @@ impl SlotManager {
     }
 
     /// Unregister a provider, typically when its worker starts shutdown.
-    pub fn unregister(&self, id: WorkerKey) {
+    pub fn unregister(&self, id: WorkerKey) -> Option<Box<dyn SlotProvider + Send + Sync>> {
         self.manager.write().unregister(id)
     }
 

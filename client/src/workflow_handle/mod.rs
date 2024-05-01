@@ -75,7 +75,7 @@ impl WorkflowExecutionInfo {
 }
 
 /// A workflow handle to a workflow with unknown types. Uses raw payloads.
-pub type UntypedWorkflowHandle<CT> = WorkflowHandle<CT, Vec<Payload>>;
+pub(crate) type UntypedWorkflowHandle<CT> = WorkflowHandle<CT, Vec<Payload>>;
 
 impl<CT, RT> WorkflowHandle<CT, RT>
 where
@@ -91,10 +91,12 @@ where
         }
     }
 
+    /// Get the workflow execution info
     pub fn info(&self) -> &WorkflowExecutionInfo {
         &self.info
     }
 
+    /// Await the result of the workflow execution
     pub async fn get_workflow_result(
         &self,
         opts: GetWorkflowResultOpts,
