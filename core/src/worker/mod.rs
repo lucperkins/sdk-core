@@ -1,9 +1,15 @@
 mod activities;
 pub(crate) mod client;
 mod slot_provider;
+pub(crate) mod tuner;
 mod workflow;
 
 pub use temporal_sdk_core_api::worker::{WorkerConfig, WorkerConfigBuilder};
+pub use tuner::{
+    FixedSizeSlotSupplier, RealSysInfo, ResourceBasedSlotsOptions,
+    ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner, ResourceSlotOptions, SlotSupplierOptions,
+    TunerBuilder, TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder,
+};
 
 pub(crate) use activities::{
     ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
@@ -11,10 +17,8 @@ pub(crate) use activities::{
 };
 pub(crate) use workflow::{wft_poller::new_wft_poller, LEGACY_QUERY_ID};
 
-use temporal_client::{ConfiguredClient, TemporalServiceClientWithMetrics, WorkerKey};
-
 use crate::{
-    abstractions::{dbg_panic, MeteredSemaphore},
+    abstractions::{dbg_panic, MeteredPermitDealer},
     errors::CompleteWfError,
     pollers::{
         new_activity_task_buffer, new_workflow_task_buffer, BoxedActPoller, WorkflowTaskPoller,
@@ -46,6 +50,7 @@ use std::{
         Arc,
     },
 };
+use temporal_client::{ConfiguredClient, TemporalServiceClientWithMetrics, WorkerKey};
 use temporal_sdk_core_protos::{
     coresdk::{
         activity_result::activity_execution_result,
@@ -65,6 +70,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use temporal_sdk_core_api::errors::WorkerValidationError;
 #[cfg(test)]
 use {
     crate::{
@@ -78,7 +84,7 @@ use {
 /// A worker polls on a certain task queue
 pub struct Worker {
     config: WorkerConfig,
-    wf_client: Arc<dyn WorkerClient>,
+    client: Arc<dyn WorkerClient>,
     /// Registration key to enable eager workflow start for this worker
     worker_key: Mutex<Option<WorkerKey>>,
     /// Manages all workflows and WFT processing
@@ -100,6 +106,11 @@ pub struct Worker {
 
 #[async_trait::async_trait]
 impl WorkerTrait for Worker {
+    async fn validate(&self) -> Result<(), WorkerValidationError> {
+        self.verify_namespace_exists().await?;
+        Ok(())
+    }
+
     async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollWfError> {
         self.next_workflow_activation().await
     }
@@ -169,7 +180,7 @@ impl WorkerTrait for Worker {
         self.shutdown_token.cancel();
         // First, disable Eager Workflow Start
         if let Some(key) = *self.worker_key.lock() {
-            self.wf_client.workers().unregister(key);
+            self.client.workers().unregister(key);
         }
         // Second, we want to stop polling of both activity and workflow tasks
         if let Some(atm) = self.at_task_mgr.as_ref() {
@@ -221,11 +232,11 @@ impl Worker {
     pub fn replace_client(&self, new_client: ConfiguredClient<TemporalServiceClientWithMetrics>) {
         // Unregister worker from current client, register in new client at the end
         let mut worker_key = self.worker_key.lock();
-        let slot_provider = (*worker_key).and_then(|k| self.wf_client.workers().unregister(k));
-        self.wf_client
+        let slot_provider = (*worker_key).and_then(|k| self.client.workers().unregister(k));
+        self.client
             .replace_client(super::init_worker_client(&self.config, new_client));
-        *worker_key = slot_provider
-            .and_then(|slot_provider| self.wf_client.workers().register(slot_provider));
+        *worker_key =
+            slot_provider.and_then(|slot_provider| self.client.workers().register(slot_provider));
     }
 
     #[cfg(test)]
@@ -233,7 +244,6 @@ impl Worker {
         Self::new(config, None, Arc::new(client), None)
     }
 
-    #[allow(clippy::too_many_arguments)] // Not much worth combining here
     pub(crate) fn new_with_pollers(
         config: WorkerConfig,
         sticky_queue_name: Option<String>,
@@ -241,22 +251,40 @@ impl Worker {
         task_pollers: TaskPollers,
         telem_instance: Option<&TelemetryInstance>,
     ) -> Self {
-        let metrics = if let Some(ti) = telem_instance {
-            MetricsContext::top_level(config.namespace.clone(), config.task_queue.clone(), ti)
+        let (metrics, meter) = if let Some(ti) = telem_instance {
+            (
+                MetricsContext::top_level(config.namespace.clone(), config.task_queue.clone(), ti),
+                ti.get_metric_meter(),
+            )
         } else {
-            MetricsContext::no_op()
+            (MetricsContext::no_op(), None)
         };
+        let tuner = config
+            .tuner
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(TunerBuilder::from_config(&config).build()));
+
         metrics.worker_registered();
+        if let Some(meter) = meter {
+            tuner.attach_metrics(meter.clone());
+        }
         let shutdown_token = CancellationToken::new();
-        let wft_semaphore = Arc::new(MeteredSemaphore::new(
-            config.max_outstanding_workflow_tasks,
+        let wft_slots = Arc::new(MeteredPermitDealer::new(
+            tuner.workflow_task_slot_supplier(),
             metrics.with_new_attrs([workflow_worker_type()]),
-            MetricsContext::available_task_slots,
+            if config.max_cached_workflows > 0 {
+                // Since we always need to be able to poll the normal task queue as well as the
+                // sticky queue, we need a value of at least 2 here.
+                Some(std::cmp::max(2, config.max_cached_workflows))
+            } else {
+                None
+            },
         ));
-        let act_semaphore = Arc::new(MeteredSemaphore::new(
-            config.max_outstanding_activities,
+        let act_slots = Arc::new(MeteredPermitDealer::new(
+            tuner.activity_task_slot_supplier(),
             metrics.with_new_attrs([activity_worker_type()]),
-            MetricsContext::available_task_slots,
+            None,
         ));
         let (external_wft_tx, external_wft_rx) = unbounded_channel();
         let (wft_stream, act_poller) = match task_pollers {
@@ -276,7 +304,7 @@ impl Worker {
                         normal_name: "".to_string(),
                     },
                     max_nonsticky_polls,
-                    wft_semaphore.clone(),
+                    wft_slots.clone(),
                     shutdown_token.child_token(),
                     Some(move |np| {
                         wft_metrics.record_num_pollers(np);
@@ -292,7 +320,7 @@ impl Worker {
                             normal_name: config.task_queue.clone(),
                         },
                         max_sticky_polls,
-                        wft_semaphore.clone(),
+                        wft_slots.clone(),
                         shutdown_token.child_token(),
                         Some(move |np| {
                             sticky_metrics.record_num_pollers(np);
@@ -307,7 +335,7 @@ impl Worker {
                         client.clone(),
                         config.task_queue.clone(),
                         config.max_concurrent_at_polls,
-                        act_semaphore.clone(),
+                        act_slots.clone(),
                         config.max_task_queue_activities_per_second,
                         shutdown_token.child_token(),
                         Some(move |np| act_metrics.record_num_pollers(np)),
@@ -338,16 +366,12 @@ impl Worker {
                 wft_stream,
                 act_poller,
             } => {
-                let ap =
-                    act_poller.map(|ap| MockPermittedPollBuffer::new(act_semaphore.clone(), ap));
-                let wft_semaphore = wft_semaphore.clone();
+                let ap = act_poller.map(|ap| MockPermittedPollBuffer::new(act_slots.clone(), ap));
+                let wft_semaphore = wft_slots.clone();
                 let wfs = wft_stream.then(move |s| {
                     let wft_semaphore = wft_semaphore.clone();
                     async move {
-                        let permit = wft_semaphore
-                            .acquire_owned()
-                            .await
-                            .expect("Mock WFT stream should not see closed semaphore");
+                        let permit = wft_semaphore.acquire_owned().await;
                         s.map(|s| (s, permit))
                     }
                 });
@@ -358,14 +382,14 @@ impl Worker {
 
         let (hb_tx, hb_rx) = unbounded_channel();
         let local_act_mgr = Arc::new(LocalActivityManager::new(
-            config.max_outstanding_local_activities,
+            tuner.local_activity_slot_supplier(),
             config.namespace.clone(),
             hb_tx,
             metrics.with_new_attrs([local_activity_worker_type()]),
         ));
         let at_task_mgr = act_poller.map(|ap| {
             WorkerActivityTasks::new(
-                act_semaphore,
+                act_slots,
                 ap,
                 client.clone(),
                 metrics.clone(),
@@ -383,19 +407,19 @@ impl Worker {
         let provider = SlotProvider::new(
             config.namespace.clone(),
             config.task_queue.clone(),
-            wft_semaphore.clone(),
+            wft_slots.clone(),
             external_wft_tx,
         );
         let worker_key = Mutex::new(client.workers().register(Box::new(provider)));
         Self {
             worker_key,
-            wf_client: client.clone(),
+            client: client.clone(),
             workflows: Workflows::new(
                 build_wf_basics(
                     config.clone(),
                     metrics,
                     shutdown_token.child_token(),
-                    client.capabilities().clone().unwrap_or_default(),
+                    client.capabilities().unwrap_or_default(),
                 ),
                 sticky_queue_name.map(|sq| StickyExecutionAttributes {
                     worker_task_queue: Some(TaskQueue {
@@ -411,7 +435,7 @@ impl Worker {
                     ),
                 }),
                 client,
-                wft_semaphore,
+                wft_slots,
                 wft_stream,
                 la_sink,
                 local_act_mgr.clone(),
@@ -484,11 +508,11 @@ impl Worker {
     }
 
     #[allow(unused)]
-    pub(crate) fn available_wft_permits(&self) -> usize {
+    pub(crate) fn available_wft_permits(&self) -> Option<usize> {
         self.workflows.available_wft_permits()
     }
     #[cfg(test)]
-    pub(crate) fn unused_wft_permits(&self) -> usize {
+    pub(crate) fn unused_wft_permits(&self) -> Option<usize> {
         self.workflows.unused_wft_permits()
     }
 
@@ -546,27 +570,33 @@ impl Worker {
             }
         };
 
-        tokio::select! {
+        let r = tokio::select! {
             biased;
 
             r = local_activities_poll => r,
             r = act_mgr_poll => r,
+        };
+        // Since we consider network errors (at this level) fatal, we want to start shutdown if one
+        // is encountered
+        if matches!(r, Err(PollActivityError::TonicError(_))) {
+            self.initiate_shutdown();
         }
+        r
     }
 
     /// Attempt to record an activity heartbeat
     pub(crate) fn record_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.at_task_mgr.as_ref() {
-            let tt = details.task_token.clone();
+            let tt = TaskToken(details.task_token.clone());
             if let Err(e) = at_mgr.record_heartbeat(details) {
-                warn!(task_token = ?tt, details = ?e, "Activity heartbeat failed.");
+                warn!(task_token = %tt, details = ?e, "Activity heartbeat failed.");
             }
         }
     }
 
     #[instrument(skip(self, task_token, status),
-                 fields(task_token=%&task_token, status=%&status,
-                        task_queue=%self.config.task_queue, workflow_id, run_id))]
+        fields(task_token=%&task_token, status=%&status,
+               task_queue=%self.config.task_queue, workflow_id, run_id))]
     pub(crate) async fn complete_activity(
         &self,
         task_token: TaskToken,
@@ -580,7 +610,7 @@ impl Worker {
         }
 
         if let Some(atm) = &self.at_task_mgr {
-            atm.complete(task_token, status, &*self.wf_client).await;
+            atm.complete(task_token, status, &*self.client).await;
         } else {
             error!(
                 "Tried to complete activity {} on a worker that does not have an activity manager",
@@ -593,20 +623,22 @@ impl Worker {
     #[instrument(skip(self), fields(run_id, workflow_id, task_queue=%self.config.task_queue))]
     pub(crate) async fn next_workflow_activation(&self) -> Result<WorkflowActivation, PollWfError> {
         let r = self.workflows.next_workflow_activation().await;
-        // In the event workflows are shutdown, begin shutdown of everything else, since that's
-        // about to happen anyway. Tell the local activity manager that, so that it can know to
-        // cancel any remaining outstanding LAs and shutdown.
-        if matches!(r, Err(PollWfError::ShutDown)) {
+        // In the event workflows are shutdown or erroring, begin shutdown of everything else. Once
+        // they are shut down, tell the local activity manager that, so that it can know to cancel
+        // any remaining outstanding LAs and shutdown.
+        if let Err(ref e) = r {
             // This is covering the situation where WFT pollers dying is the reason for shutdown
             self.initiate_shutdown();
-            self.local_act_mgr.workflows_have_shutdown();
+            if matches!(e, PollWfError::ShutDown) {
+                self.local_act_mgr.workflows_have_shutdown();
+            }
         }
         r
     }
 
     #[instrument(skip(self, completion),
-                 fields(completion=%&completion, run_id=%completion.run_id, workflow_id,
-                        task_queue=%self.config.task_queue))]
+        fields(completion=%&completion, run_id=%completion.run_id, workflow_id,
+               task_queue=%self.config.task_queue))]
     pub(crate) async fn complete_workflow_activation(
         &self,
         completion: WorkflowActivationCompletion,
@@ -668,6 +700,20 @@ impl Worker {
     fn notify_local_result(&self, run_id: &str, res: LocalResolution) {
         self.workflows.notify_of_local_result(run_id, res);
     }
+
+    async fn verify_namespace_exists(&self) -> Result<(), WorkerValidationError> {
+        if let Err(e) = self.client.describe_namespace().await {
+            // Ignore if unimplemented since we wouldn't want to fail against an old server, for
+            // example.
+            if e.code() != tonic::Code::Unimplemented {
+                return Err(WorkerValidationError::NamespaceDescribeError {
+                    source: e,
+                    namespace: self.config.namespace.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PostActivateHookData<'a> {
@@ -728,7 +774,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .remaining_activity_capacity(),
-            5
+            Some(5)
         );
     }
 
@@ -745,16 +791,15 @@ mod tests {
             .unwrap();
         let worker = Worker::new_test(cfg, mock_client);
         assert!(worker.activity_poll().await.is_err());
-        assert_eq!(worker.at_task_mgr.unwrap().remaining_activity_capacity(), 5);
+        assert_eq!(
+            worker.at_task_mgr.unwrap().remaining_activity_capacity(),
+            Some(5)
+        );
     }
 
     #[test]
     fn max_polls_calculated_properly() {
-        let mut wcb = WorkerConfigBuilder::default();
-        let cfg = wcb
-            .namespace("default")
-            .task_queue("whatever")
-            .worker_build_id("test_bin_id")
+        let cfg = test_worker_cfg()
             .max_concurrent_wft_polls(5_usize)
             .build()
             .unwrap();

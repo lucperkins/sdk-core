@@ -11,8 +11,8 @@ use super::{
 use crate::{abstractions::dbg_panic, telemetry::metrics::DEFAULT_S_BUCKETS};
 use opentelemetry::{
     self,
-    metrics::{Meter, MeterProvider as MeterProviderT, Unit},
-    KeyValue,
+    metrics::{Meter, MeterProvider as MeterProviderT},
+    Key, KeyValue, Value,
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -20,9 +20,10 @@ use opentelemetry_sdk::{
         data::Temporality,
         new_view,
         reader::{AggregationSelector, DefaultAggregationSelector, TemporalitySelector},
-        Aggregation, Instrument, InstrumentKind, MeterProviderBuilder, PeriodicReader, View,
+        Aggregation, AttributeSet, Instrument, InstrumentKind, MeterProviderBuilder,
+        PeriodicReader, SdkMeterProvider, View,
     },
-    runtime, AttributeSet, Resource,
+    runtime, Resource,
 };
 use parking_lot::RwLock;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -34,7 +35,7 @@ use temporal_sdk_core_api::telemetry::{
     MetricTemporality, OtelCollectorOptions, PrometheusExporterOptions,
 };
 use tokio::task::AbortHandle;
-use tonic::metadata::MetadataMap;
+use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
 
 /// Chooses appropriate aggregators for our metrics
 #[derive(Debug, Clone)]
@@ -116,7 +117,7 @@ macro_rules! impl_memory_gauge {
             fn new(params: MetricParameters, meter: &Meter) -> Self {
                 let gauge = meter
                     .$gauge_fn(params.name)
-                    .with_unit(Unit::new(params.unit))
+                    .with_unit(params.unit)
                     .with_description(params.description)
                     .init();
                 let map = Arc::new(RwLock::new(HashMap::<AttributeSet, $ty>::new()));
@@ -159,8 +160,12 @@ impl<U> MemoryGauge<U> {
 pub fn build_otlp_metric_exporter(
     opts: OtelCollectorOptions,
 ) -> Result<CoreOtelMeter, anyhow::Error> {
-    let exporter = opentelemetry_otlp::TonicExporterBuilder::default()
-        .with_endpoint(opts.url.to_string())
+    let mut exporter =
+        opentelemetry_otlp::TonicExporterBuilder::default().with_endpoint(opts.url.to_string());
+    if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
+        exporter = exporter.with_tls_config(ClientTlsConfig::new().with_native_roots());
+    }
+    let exporter = exporter
         .with_metadata(MetadataMap::from_headers((&opts.headers).try_into()?))
         .build_metrics_exporter(
             Box::new(SDKAggSelector::new(opts.use_seconds_for_durations)),
@@ -178,6 +183,7 @@ pub fn build_otlp_metric_exporter(
     Ok::<_, anyhow::Error>(CoreOtelMeter {
         meter: mp.meter(TELEM_SERVICE_NAME),
         use_seconds_for_durations: opts.use_seconds_for_durations,
+        _mp: mp,
     })
 }
 
@@ -208,6 +214,7 @@ pub fn start_prometheus_metric_exporter(
         meter: Arc::new(CoreOtelMeter {
             meter: meter_provider.meter(TELEM_SERVICE_NAME),
             use_seconds_for_durations: opts.use_seconds_for_durations,
+            _mp: meter_provider,
         }),
         bound_addr,
         abort_handle: handle.abort_handle(),
@@ -218,6 +225,9 @@ pub fn start_prometheus_metric_exporter(
 pub struct CoreOtelMeter {
     meter: Meter,
     use_seconds_for_durations: bool,
+    // we have to hold on to the provider otherwise otel automatically shuts it down on drop
+    // for whatever crazy reason
+    _mp: SdkMeterProvider,
 }
 
 impl CoreMeter for CoreOtelMeter {
@@ -245,7 +255,7 @@ impl CoreMeter for CoreOtelMeter {
         Arc::new(
             self.meter
                 .u64_counter(params.name)
-                .with_unit(Unit::new(params.unit))
+                .with_unit(params.unit)
                 .with_description(params.description)
                 .init(),
         )
@@ -255,7 +265,7 @@ impl CoreMeter for CoreOtelMeter {
         Arc::new(
             self.meter
                 .u64_histogram(params.name)
-                .with_unit(Unit::new(params.unit))
+                .with_unit(params.unit)
                 .with_description(params.description)
                 .init(),
         )
@@ -265,7 +275,7 @@ impl CoreMeter for CoreOtelMeter {
         Arc::new(
             self.meter
                 .f64_histogram(params.name)
-                .with_unit(Unit::new(params.unit))
+                .with_unit(params.unit)
                 .with_description(params.description)
                 .init(),
         )
@@ -324,18 +334,31 @@ impl GaugeF64 for MemoryGauge<f64> {
     }
 }
 
-fn default_resource_kvs() -> &'static [KeyValue] {
+fn default_resource_instance() -> &'static Resource {
     use once_cell::sync::OnceCell;
 
-    static INSTANCE: OnceCell<[KeyValue; 1]> = OnceCell::new();
-    INSTANCE.get_or_init(|| [KeyValue::new("service.name", TELEM_SERVICE_NAME)])
+    static INSTANCE: OnceCell<Resource> = OnceCell::new();
+    INSTANCE.get_or_init(|| {
+        let resource = Resource::default();
+        if resource.get(Key::from("service.name")) == Some(Value::from("unknown_service")) {
+            // otel spec recommends to leave service.name as unknown_service but we want to
+            // maintain backwards compatability with existing library behaviour
+            return resource.merge(&Resource::new([KeyValue::new(
+                "service.name",
+                TELEM_SERVICE_NAME,
+            )]));
+        }
+        resource
+    })
 }
 
 fn default_resource(override_values: &HashMap<String, String>) -> Resource {
     let override_kvs = override_values
         .iter()
         .map(|(k, v)| KeyValue::new(k.clone(), v.clone()));
-    Resource::new(default_resource_kvs().iter().cloned()).merge(&Resource::new(override_kvs))
+    default_resource_instance()
+        .clone()
+        .merge(&Resource::new(override_kvs))
 }
 
 #[derive(Clone)]
@@ -351,5 +374,18 @@ fn metric_temporality_to_selector(t: MetricTemporality) -> impl TemporalitySelec
     match t {
         MetricTemporality::Cumulative => ConstantTemporality(Temporality::Cumulative),
         MetricTemporality::Delta => ConstantTemporality(Temporality::Delta),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use opentelemetry::Key;
+
+    #[test]
+    pub(crate) fn default_resource_instance_service_name_default() {
+        let resource = default_resource_instance();
+        let service_name = resource.get(Key::from("service.name"));
+        assert_eq!(service_name, Some(Value::from(TELEM_SERVICE_NAME)));
     }
 }

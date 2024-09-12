@@ -28,7 +28,7 @@ use temporal_sdk_core_protos::{
         history::v1::{
             history_event, ActivityTaskCanceledEventAttributes,
             ActivityTaskCompletedEventAttributes, ActivityTaskFailedEventAttributes,
-            ActivityTaskTimedOutEventAttributes, HistoryEvent,
+            ActivityTaskTimedOutEventAttributes,
         },
     },
 };
@@ -90,13 +90,13 @@ fsm! {
 
 #[derive(Debug, derive_more::Display)]
 pub(super) enum ActivityMachineCommand {
-    #[display(fmt = "Complete")]
+    #[display("Complete")]
     Complete(Option<Payloads>),
-    #[display(fmt = "Fail")]
+    #[display("Fail")]
     Fail(Failure),
-    #[display(fmt = "Cancel")]
+    #[display("Cancel")]
     Cancel(Option<ActivityTaskCanceledEventAttributes>),
-    #[display(fmt = "RequestCancellation")]
+    #[display("RequestCancellation")]
     RequestCancellation(Command),
 }
 
@@ -134,6 +134,7 @@ impl ActivityMachine {
                 s.shared_state().attrs.clone(),
                 use_compatible_version,
             )),
+            user_metadata: Default::default(),
         };
         NewMachineWithCommand {
             command,
@@ -165,6 +166,7 @@ impl ActivityMachine {
                     failure: Some(new_cancel_failure(&self.shared_state, attrs)),
                 })),
             }),
+            is_local: false,
         }
     }
 }
@@ -264,6 +266,7 @@ impl WFMachinesAdapter for ActivityMachine {
                             result: convert_payloads(event_info, result)?,
                         })),
                     }),
+                    is_local: false,
                 }
                 .into()]
             }
@@ -275,6 +278,7 @@ impl WFMachinesAdapter for ActivityMachine {
                             failure: Some(failure),
                         })),
                     }),
+                    is_local: false,
                 }
                 .into()]
             }
@@ -285,19 +289,6 @@ impl WFMachinesAdapter for ActivityMachine {
                 vec![self.create_cancelation_resolve(attrs).into()]
             }
         })
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::ActivityTaskScheduled
-                | EventType::ActivityTaskStarted
-                | EventType::ActivityTaskCompleted
-                | EventType::ActivityTaskFailed
-                | EventType::ActivityTaskTimedOut
-                | EventType::ActivityTaskCancelRequested
-                | EventType::ActivityTaskCanceled
-        )
     }
 }
 
@@ -419,7 +410,7 @@ impl ScheduleCommandCreated {
 
     pub(super) fn on_abandoned(self, dat: &mut SharedState) -> ActivityMachineTransition<Canceled> {
         dat.cancelled_before_sent = true;
-        ActivityMachineTransition::default()
+        notify_lang_activity_cancelled(None)
     }
 }
 
@@ -700,6 +691,7 @@ where
                 },
             ),
         ),
+        user_metadata: Default::default(),
     };
     ActivityMachineTransition::ok(
         vec![ActivityMachineCommand::RequestCancellation(cmd)],
@@ -817,7 +809,7 @@ mod test {
         internal_flags::InternalFlags,
         replay::TestHistoryBuilder,
         test_help::{build_fake_sdk, MockPollCfg, ResponseType},
-        worker::workflow::machines::Machines,
+        worker::workflow::{machines::Machines, OutgoingJob},
     };
     use std::{cell::RefCell, mem::discriminant, rc::Rc};
     use temporal_sdk::{ActivityOptions, CancellableFuture, WfContext, WorkflowFunction};
@@ -849,7 +841,7 @@ mod test {
             assert_matches!(
                 a.jobs.as_slice(),
                 [WorkflowActivationJob {
-                    variant: Some(workflow_activation_job::Variant::StartWorkflow(_)),
+                    variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
                 }]
             )
         });
@@ -916,7 +908,20 @@ mod test {
             panic!("Wrong machine type");
         };
         let cmds = s.cancel().unwrap();
-        assert_eq!(cmds.len(), 0);
+        // We should always be notifying lang that the activity got cancelled, even if it's
+        // abandoned and we aren't telling server
+        assert_matches!(
+            cmds.as_slice(),
+            [MachineResponse::PushWFJob(OutgoingJob {
+                variant: workflow_activation_job::Variant::ResolveActivity(ResolveActivity {
+                    result: Some(ActivityResolution {
+                        status: Some(activity_resolution::Status::Cancelled(_))
+                    }),
+                    ..
+                }),
+                ..
+            })]
+        );
         let curstate = s.state();
         assert!(matches!(curstate, &ActivityMachineState::Canceled(_)));
     }

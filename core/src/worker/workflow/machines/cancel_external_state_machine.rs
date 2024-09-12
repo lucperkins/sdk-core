@@ -14,7 +14,7 @@ use temporal_sdk_core_protos::{
         command::v1::{command, Command, RequestCancelExternalWorkflowExecutionCommandAttributes},
         enums::v1::{CancelExternalWorkflowExecutionFailedCause, CommandType, EventType},
         failure::v1::{failure::FailureInfo, ApplicationFailureInfo, Failure},
-        history::v1::{history_event, HistoryEvent},
+        history::v1::history_event,
     },
 };
 
@@ -51,7 +51,7 @@ pub(super) struct SharedState {
 pub(super) enum CancelExternalCommand {
     /// The target workflow has been notified of the cancel
     Requested,
-    #[display(fmt = "Failed")]
+    #[display("Failed")]
     Failed(CancelExternalWorkflowExecutionFailedCause),
 }
 
@@ -78,6 +78,7 @@ pub(super) fn new_external_cancel(
     let cmd = Command {
         command_type: CommandType::RequestCancelExternalWorkflowExecution as i32,
         attributes: Some(cmd_attrs),
+        user_metadata: Default::default(),
     };
     NewMachineWithCommand {
         command: cmd,
@@ -209,15 +210,6 @@ impl WFMachinesAdapter for CancelExternalMachine {
                 .into()]
             }
         })
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::ExternalWorkflowExecutionCancelRequested
-                | EventType::RequestCancelExternalWorkflowExecutionFailed
-                | EventType::RequestCancelExternalWorkflowExecutionInitiated
-        )
     }
 }
 

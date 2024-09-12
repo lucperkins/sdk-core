@@ -13,11 +13,12 @@ use crate::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use futures::{task::Context, FutureExt, Stream, StreamExt};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::{
     collections::HashMap,
     future::Future,
     marker::PhantomData,
+    ops::Deref,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -40,7 +41,7 @@ use temporal_sdk_core_protos::{
             SignalExternalWorkflowExecution, StartTimer, UpsertWorkflowSearchAttributes,
         },
     },
-    temporal::api::common::v1::{Memo, Payload},
+    temporal::api::common::v1::{Memo, Payload, SearchAttributes},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -57,52 +58,6 @@ pub struct WfContext {
     pub(crate) shared: Arc<RwLock<WfContextSharedData>>,
 
     seq_nums: Arc<RwLock<WfCtxProtectedDat>>,
-}
-
-struct WfCtxProtectedDat {
-    next_timer_sequence_number: u32,
-    next_activity_sequence_number: u32,
-    next_child_workflow_sequence_number: u32,
-    next_cancel_external_wf_sequence_number: u32,
-    next_signal_external_wf_sequence_number: u32,
-}
-
-impl WfCtxProtectedDat {
-    fn next_timer_seq(&mut self) -> u32 {
-        let seq = self.next_timer_sequence_number;
-        self.next_timer_sequence_number += 1;
-        seq
-    }
-    fn next_activity_seq(&mut self) -> u32 {
-        let seq = self.next_activity_sequence_number;
-        self.next_activity_sequence_number += 1;
-        seq
-    }
-    fn next_child_workflow_seq(&mut self) -> u32 {
-        let seq = self.next_child_workflow_sequence_number;
-        self.next_child_workflow_sequence_number += 1;
-        seq
-    }
-    fn next_cancel_external_wf_seq(&mut self) -> u32 {
-        let seq = self.next_cancel_external_wf_sequence_number;
-        self.next_cancel_external_wf_sequence_number += 1;
-        seq
-    }
-    fn next_signal_external_wf_seq(&mut self) -> u32 {
-        let seq = self.next_signal_external_wf_sequence_number;
-        self.next_signal_external_wf_sequence_number += 1;
-        seq
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct WfContextSharedData {
-    /// Maps change ids -> resolved status
-    pub(crate) changes: HashMap<String, bool>,
-    pub(crate) is_replaying: bool,
-    pub(crate) wf_time: Option<SystemTime>,
-    pub(crate) history_length: u32,
-    pub(crate) current_build_id: Option<String>,
 }
 
 // TODO: Dataconverter type interface to replace Payloads here. Possibly just use serde
@@ -143,6 +98,11 @@ impl WfContext {
         &self.namespace
     }
 
+    /// Return the task queue the workflow is executing in
+    pub fn task_queue(&self) -> &str {
+        &self.task_queue
+    }
+
     /// Get the arguments provided to the workflow upon execution start
     pub fn get_args(&self) -> &[Payload] {
         self.args.as_slice()
@@ -162,6 +122,16 @@ impl WfContext {
     /// code is being executed for the first time, return this Worker's Build ID if it has one.
     pub fn current_build_id(&self) -> Option<String> {
         self.shared.read().current_build_id.clone()
+    }
+
+    /// Return current values for workflow search attributes
+    pub fn search_attributes(&self) -> impl Deref<Target = SearchAttributes> + '_ {
+        RwLockReadGuard::map(self.shared.read(), |s| &s.search_attributes)
+    }
+
+    /// Return the workflow's randomness seed
+    pub fn random_seed(&self) -> u64 {
+        self.shared.read().random_seed
     }
 
     /// A future that resolves if/when the workflow is cancelled
@@ -203,8 +173,8 @@ impl WfContext {
         &self,
         mut opts: ActivityOptions,
     ) -> impl CancellableFuture<ActivityResolution> {
-        if opts.task_queue.is_empty() {
-            opts.task_queue = self.task_queue.clone()
+        if opts.task_queue.is_none() {
+            opts.task_queue = Some(self.task_queue.clone());
         }
         let seq = self.seq_nums.write().next_activity_seq();
         let (cmd, unblocker) = CancellableWFCommandFut::new(CancellableID::Activity(seq));
@@ -409,6 +379,54 @@ impl WfContext {
     }
 }
 
+struct WfCtxProtectedDat {
+    next_timer_sequence_number: u32,
+    next_activity_sequence_number: u32,
+    next_child_workflow_sequence_number: u32,
+    next_cancel_external_wf_sequence_number: u32,
+    next_signal_external_wf_sequence_number: u32,
+}
+
+impl WfCtxProtectedDat {
+    fn next_timer_seq(&mut self) -> u32 {
+        let seq = self.next_timer_sequence_number;
+        self.next_timer_sequence_number += 1;
+        seq
+    }
+    fn next_activity_seq(&mut self) -> u32 {
+        let seq = self.next_activity_sequence_number;
+        self.next_activity_sequence_number += 1;
+        seq
+    }
+    fn next_child_workflow_seq(&mut self) -> u32 {
+        let seq = self.next_child_workflow_sequence_number;
+        self.next_child_workflow_sequence_number += 1;
+        seq
+    }
+    fn next_cancel_external_wf_seq(&mut self) -> u32 {
+        let seq = self.next_cancel_external_wf_sequence_number;
+        self.next_cancel_external_wf_sequence_number += 1;
+        seq
+    }
+    fn next_signal_external_wf_seq(&mut self) -> u32 {
+        let seq = self.next_signal_external_wf_sequence_number;
+        self.next_signal_external_wf_sequence_number += 1;
+        seq
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WfContextSharedData {
+    /// Maps change ids -> resolved status
+    pub(crate) changes: HashMap<String, bool>,
+    pub(crate) is_replaying: bool,
+    pub(crate) wf_time: Option<SystemTime>,
+    pub(crate) history_length: u32,
+    pub(crate) current_build_id: Option<String>,
+    pub(crate) search_attributes: SearchAttributes,
+    pub(crate) random_seed: u64,
+}
+
 /// Helper Wrapper that can drain the channel into a Vec<SignalData> in a blocking way.  Useful
 /// for making sure channels are empty before ContinueAsNew-ing a workflow
 pub struct DrainableSignalStream(UnboundedReceiverStream<SignalData>);
@@ -573,7 +591,8 @@ impl<'a> Future for LATimerBackoffFut<'a> {
                     if let TimerResult::Fired = tr {
                         let mut opts = self.la_opts.clone();
                         opts.attempt = Some(self.next_attempt);
-                        opts.original_schedule_time = self.next_sched_time.clone();
+                        opts.original_schedule_time
+                            .clone_from(&self.next_sched_time);
                         self.current_fut = Box::pin(self.ctx.local_activity_no_timer_retry(opts));
                         Poll::Pending
                     } else {
@@ -601,14 +620,13 @@ impl<'a> Future for LATimerBackoffFut<'a> {
 
                 let timer_f = self.ctx.timer(
                     b.backoff_duration
-                        .clone()
                         .expect("Duration is set")
                         .try_into()
                         .expect("duration converts ok"),
                 );
                 self.timer_fut = Some(Box::pin(timer_f));
                 self.next_attempt = b.attempt;
-                self.next_sched_time = b.original_schedule_time.clone();
+                self.next_sched_time.clone_from(&b.original_schedule_time);
                 return Poll::Pending;
             }
         }

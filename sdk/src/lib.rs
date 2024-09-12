@@ -53,6 +53,7 @@ mod workflow_future;
 
 pub use activity_context::ActContext;
 pub use temporal_client::Namespace;
+use tracing::{field, Instrument, Span};
 pub use workflow_context::{
     ActivityOptions, CancellableFuture, ChildWorkflow, ChildWorkflowOptions, LocalActivityOptions,
     PendingChildWorkflow, Signal, SignalData, SignalWorkflowOptions, StartedChildWorkflow,
@@ -72,6 +73,7 @@ use std::{
     future::Future,
     panic::AssertUnwindSafe,
     sync::Arc,
+    time::Duration,
 };
 use temporal_client::ClientOptionsBuilder;
 use temporal_sdk_core::Url;
@@ -93,7 +95,11 @@ use temporal_sdk_core_protos::{
         workflow_completion::WorkflowActivationCompletion,
         ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
     },
-    temporal::api::{common::v1::Payload, failure::v1::Failure},
+    temporal::api::{
+        common::v1::Payload,
+        enums::v1::WorkflowTaskFailedCause,
+        failure::v1::{failure, Failure},
+    },
     TaskToken,
 };
 use tokio::{
@@ -247,7 +253,7 @@ impl Worker {
                         let wf_half = &*wf_half;
                         async move {
                             join_handle.await??;
-                            info!(run_id=%run_id, "Removing workflow from cache");
+                            debug!(run_id=%run_id, "Removing workflow from cache");
                             wf_half.workflows.borrow_mut().remove(&run_id);
                             Ok(())
                         }
@@ -390,21 +396,31 @@ impl WorkflowHalf {
         let mut res = None;
         let run_id = activation.run_id.clone();
 
-        // If the activation is to start a workflow, create a new workflow driver for it,
+        // If the activation is to init a workflow, create a new workflow driver for it,
         // using the function associated with that workflow id
         if let Some(sw) = activation.jobs.iter().find_map(|j| match j.variant {
-            Some(Variant::StartWorkflow(ref sw)) => Some(sw),
+            Some(Variant::InitializeWorkflow(ref sw)) => Some(sw),
             _ => None,
         }) {
             let workflow_type = &sw.workflow_type;
             let wf_fns_borrow = self.workflow_fns.borrow();
-            let wf_function = wf_fns_borrow
-                .get(workflow_type)
-                .ok_or_else(|| anyhow!("Workflow type {workflow_type} not found"))?;
+            let Some(wf_function) = wf_fns_borrow.get(workflow_type) else {
+                warn!("Workflow type {workflow_type} not found");
+
+                completions_tx
+                    .send(WorkflowActivationCompletion::fail(
+                        run_id,
+                        format!("Workflow type {workflow_type} not found").into(),
+                        Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+                    ))
+                    .expect("Completion channel intact");
+                return Ok(None);
+            };
 
             let (wff, activations) = wf_function.start_workflow(
                 common.worker.get_config().namespace.clone(),
                 common.task_queue.clone(),
+                workflow_type,
                 // NOTE: Don't clone args if this gets ported to be a non-test rust worker
                 sw.arguments.clone(),
                 completions_tx.clone(),
@@ -438,6 +454,24 @@ impl WorkflowHalf {
                 .send(activation)
                 .expect("Workflow should exist if we're sending it an activation");
         } else {
+            // When we failed to start a workflow, we never inserted it into the cache.
+            // But core sends us a `RemoveFromCache` job when we mark the StartWorkflow workflow activation
+            // as a failure, which we need to complete.
+            // Other SDKs add the workflow to the cache even when the workflow type is unknown/not found.
+            // To circumvent this, we simply mark any RemoveFromCache job for workflows that are not in the cache as complete.
+            if activation.jobs.len() == 1
+                && matches!(
+                    activation.jobs.first().map(|j| &j.variant),
+                    Some(Some(Variant::RemoveFromCache(_)))
+                )
+            {
+                completions_tx
+                    .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
+                    .expect("Completion channel intact");
+                return Ok(None);
+            }
+
+            // In all other cases, we want to panic as the runtime could be in an inconsistent state at this point.
             bail!(
                 "Got activation {:?} for unknown workflow {}",
                 activation,
@@ -470,6 +504,14 @@ impl ActivityHalf {
                         )
                     })?
                     .clone();
+                let span = info_span!(
+                    "RunActivity",
+                    "otel.name" = format!("RunActivity:{}", start.activity_type),
+                    "otel.kind" = "server",
+                    "temporalActivityID" = start.activity_id,
+                    "temporalWorkflowID" = field::Empty,
+                    "temporalRunID" = field::Empty,
+                );
                 let ct = CancellationToken::new();
                 let task_token = activity.task_token;
                 self.task_tokens_to_cancels
@@ -483,10 +525,18 @@ impl ActivityHalf {
                     task_token.clone(),
                     start,
                 );
+
                 tokio::spawn(async move {
-                    let output = AssertUnwindSafe((act_fn.act_func)(ctx, arg))
-                        .catch_unwind()
-                        .await;
+                    let act_fut = async move {
+                        if let Some(info) = &ctx.get_info().workflow_execution {
+                            Span::current()
+                                .record("temporalWorkflowID", &info.workflow_id)
+                                .record("temporalRunID", &info.run_id);
+                        }
+                        (act_fn.act_func)(ctx, arg).await
+                    }
+                    .instrument(span);
+                    let output = AssertUnwindSafe(act_fut).catch_unwind().await;
                     let result = match output {
                         Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
                             format!("Activity function panicked: {}", panic_formatter(e)),
@@ -496,18 +546,27 @@ impl ActivityHalf {
                         Ok(Ok(ActExitValue::WillCompleteAsync)) => {
                             ActivityExecutionResult::will_complete_async()
                         }
-                        Ok(Err(err)) => match err.downcast::<ActivityCancelledError>() {
-                            Ok(ce) => ActivityExecutionResult::cancel_from_details(ce.details),
-                            Err(other_err) => {
-                                match other_err.downcast::<NonRetryableActivityError>() {
-                                    Ok(nre) => ActivityExecutionResult::fail(
-                                        Failure::application_failure_from_error(nre.into(), true),
-                                    ),
-                                    Err(other_err) => ActivityExecutionResult::fail(
-                                        Failure::application_failure_from_error(other_err, false),
-                                    ),
+                        Ok(Err(err)) => match err {
+                            ActivityError::Retryable {
+                                source,
+                                explicit_delay,
+                            } => ActivityExecutionResult::fail({
+                                let mut f = Failure::application_failure_from_error(source, false);
+                                if let Some(d) = explicit_delay {
+                                    if let Some(failure::FailureInfo::ApplicationFailureInfo(fi)) =
+                                        f.failure_info.as_mut()
+                                    {
+                                        fi.next_retry_delay = d.try_into().ok();
+                                    }
                                 }
+                                f
+                            }),
+                            ActivityError::Cancelled { details } => {
+                                ActivityExecutionResult::cancel_from_details(details)
                             }
+                            ActivityError::NonRetryable(nre) => ActivityExecutionResult::fail(
+                                Failure::application_failure_from_error(nre, true),
+                            ),
                         },
                     };
                     worker
@@ -788,7 +847,7 @@ impl<T: AsJsonPayloadExt> From<T> for ActExitValue<T> {
 }
 
 type BoxActFn = Arc<
-    dyn Fn(ActContext, Payload) -> BoxFuture<'static, Result<ActExitValue<Payload>, anyhow::Error>>
+    dyn Fn(ActContext, Payload) -> BoxFuture<'static, Result<ActExitValue<Payload>, ActivityError>>
         + Send
         + Sync,
 >;
@@ -799,35 +858,47 @@ pub struct ActivityFunction {
     act_func: BoxActFn,
 }
 
-/// Return this error to indicate your activity is cancelling
-#[derive(Debug, Default)]
-pub struct ActivityCancelledError {
-    details: Option<Payload>,
+/// Returned as errors from activity functions
+#[derive(Debug)]
+pub enum ActivityError {
+    /// This error can be returned from activities to allow the explicit configuration of certain
+    /// error properties. It's also the default error type that arbitrary errors will be converted
+    /// into.
+    Retryable {
+        /// The underlying error
+        source: anyhow::Error,
+        /// If specified, the next retry (if there is one) will occur after this delay
+        explicit_delay: Option<Duration>,
+    },
+    /// Return this error to indicate your activity is cancelling
+    Cancelled {
+        /// Some data to save as the cancellation reason
+        details: Option<Payload>,
+    },
+    /// Return this error to indicate that your activity non-retryable
+    /// this is a transparent wrapper around anyhow Error so essentially any type of error
+    /// could be used here.
+    NonRetryable(anyhow::Error),
 }
-impl ActivityCancelledError {
-    /// Include some details as part of concluding the activity as cancelled
-    pub fn with_details(payload: Payload) -> Self {
-        Self {
-            details: Some(payload),
+
+impl<E> From<E> for ActivityError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(source: E) -> Self {
+        Self::Retryable {
+            source: source.into(),
+            explicit_delay: None,
         }
     }
 }
-impl std::error::Error for ActivityCancelledError {}
-impl Display for ActivityCancelledError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Activity cancelled")
+
+impl ActivityError {
+    /// Construct a cancelled error without details
+    pub fn cancelled() -> Self {
+        Self::Cancelled { details: None }
     }
 }
-
-/// Return this error to indicate that your activity non-retryable
-/// this is a transparent wrapper around anyhow Error so essentially any type of error
-/// could be used here.
-///
-/// In your activity function. Return something along the lines of:
-/// `Err(NonRetryableActivityError(anyhow::anyhow!("This should *not* be retried")).into())`
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-pub struct NonRetryableActivityError(pub anyhow::Error);
 
 /// Closures / functions which can be turned into activity functions implement this trait
 pub trait IntoActivityFunc<Args, Res, Out> {
@@ -839,7 +910,7 @@ impl<A, Rf, R, O, F> IntoActivityFunc<A, Rf, O> for F
 where
     F: (Fn(ActContext, A) -> Rf) + Sync + Send + 'static,
     A: FromJsonPayloadExt + Send,
-    Rf: Future<Output = Result<R, anyhow::Error>> + Send + 'static,
+    Rf: Future<Output = Result<R, ActivityError>> + Send + 'static,
     R: Into<ActExitValue<O>>,
     O: AsJsonPayloadExt,
 {
@@ -847,20 +918,23 @@ where
         let wrapper = move |ctx: ActContext, input: Payload| {
             // Some minor gymnastics are required to avoid needing to clone the function
             match A::from_json_payload(&input) {
-                Ok(deser) => (self)(ctx, deser)
+                Ok(deser) => self(ctx, deser)
                     .map(|r| {
                         r.and_then(|r| {
                             let exit_val: ActExitValue<O> = r.into();
-                            Ok(match exit_val {
-                                ActExitValue::WillCompleteAsync => ActExitValue::WillCompleteAsync,
-                                ActExitValue::Normal(x) => {
-                                    ActExitValue::Normal(x.as_json_payload()?)
+                            match exit_val {
+                                ActExitValue::WillCompleteAsync => {
+                                    Ok(ActExitValue::WillCompleteAsync)
                                 }
-                            })
+                                ActExitValue::Normal(x) => match x.as_json_payload() {
+                                    Ok(v) => Ok(ActExitValue::Normal(v)),
+                                    Err(e) => Err(ActivityError::NonRetryable(e)),
+                                },
+                            }
                         })
                     })
                     .boxed(),
-                Err(e) => async move { Err(e.into()) }.boxed(),
+                Err(e) => async move { Err(ActivityError::NonRetryable(e.into())) }.boxed(),
             }
         };
         Arc::new(wrapper)

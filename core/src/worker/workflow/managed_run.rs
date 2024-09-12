@@ -1,6 +1,8 @@
 use crate::{
     abstractions::dbg_panic,
+    internal_flags::CoreInternalFlags,
     protosext::{protocol_messages::IncomingProtocolMessage, WorkflowActivationExt},
+    telemetry::metrics,
     worker::{
         workflow::{
             history_update::HistoryPaginator,
@@ -50,9 +52,9 @@ pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
 
 /// Manages access to a specific workflow run. Everything inside is entirely synchronous and should
 /// remain that way.
-#[derive(derive_more::DebugCustom)]
+#[derive(derive_more::Debug)]
 #[debug(
-    fmt = "ManagedRun {{ wft: {:?}, activation: {:?}, task_buffer: {:?} \
+    "ManagedRun {{ wft: {:?}, activation: {:?}, task_buffer: {:?} \
            trying_to_evict: {} }}",
     wft,
     activation,
@@ -421,20 +423,7 @@ impl ManagedRun {
             );
             Ok(None)
         } else {
-            // First strip out query responses from other commands that actually affect machines
-            // Would be prettier with `drain_filter`
-            let mut query_responses = vec![];
-            commands = std::mem::take(&mut commands)
-                .into_iter()
-                .filter_map(|x| {
-                    if let WFCommand::QueryResponse(qr) = x {
-                        query_responses.push(qr);
-                        None
-                    } else {
-                        Some(x)
-                    }
-                })
-                .collect();
+            let (commands, query_responses) = self.preprocess_command_sequence(commands);
 
             if activation_was_only_eviction && !commands.is_empty() {
                 dbg_panic!("Reply to an eviction included commands");
@@ -475,6 +464,38 @@ impl ManagedRun {
             }
 
             Ok(self.process_completion(rac))
+        }
+    }
+
+    /// Core has received from lang a sequence containing all commands generated
+    /// by all workflow coroutines. Return a command sequence containing all
+    /// non-terminal (i.e. non-workflow-terminating) commands, followed by the
+    /// first terminal command if there are any. Also strip out and return query
+    /// results (these don't affect machines and are handled separately
+    /// downstream)
+    ///
+    /// The reordering is done in order that all non-terminal commands generated
+    /// by workflow coroutines are given a chance for the server to honor them.
+    /// For example, in order to deliver an update result to a client as the
+    /// workflow completes.
+    ///
+    /// Behavior here has changed backwards-incompatibly, so a flag is set if
+    /// the outcome differs from what the outcome would have been previously.
+    /// See also CoreInternalFlags::MoveTerminalCommands docstring and
+    /// https://github.com/temporalio/features/issues/481.
+    fn preprocess_command_sequence(
+        &mut self,
+        commands: Vec<WFCommand>,
+    ) -> (Vec<WFCommand>, Vec<QueryResult>) {
+        if self.wfm.machines.replaying
+            && !self
+                .wfm
+                .machines
+                .try_use_flag(CoreInternalFlags::MoveTerminalCommands, false)
+        {
+            preprocess_command_sequence_old_behavior(commands)
+        } else {
+            preprocess_command_sequence(commands)
         }
     }
 
@@ -541,6 +562,7 @@ impl ManagedRun {
                 reason,
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
+
         let (should_report, rur) = if is_no_report_query_fail {
             (false, None)
         } else {
@@ -559,6 +581,7 @@ impl ManagedRun {
             let rur = evict_req_outcome.into_run_update_resp();
             (should_report, rur)
         };
+
         let outcome = if self.pending_work_is_legacy_query() {
             if is_no_report_query_fail {
                 ActivationCompleteOutcome::WFTFailedDontReport
@@ -596,7 +619,10 @@ impl ManagedRun {
         } else {
             ActivationCompleteOutcome::WFTFailedDontReport
         };
-        self.metrics.wf_task_failed();
+
+        self.metrics
+            .with_new_attrs([metrics::failure_reason(cause.into())])
+            .wf_task_failed();
         self.reply_to_complete(outcome, resp_chan);
         rur
     }
@@ -847,6 +873,19 @@ impl ManagedRun {
 
         if !self.activation_is_eviction() && self.trying_to_evict.is_none() {
             debug!(run_id=%info.run_id, reason=%info.message, "Eviction requested");
+            // If we've requested an eviction because of failure related reasons then we want to
+            // delete any pending queries, since handling them no longer makes sense. Evictions
+            // because the cache is full should get a chance to finish processing properly.
+            if !matches!(info.reason, EvictionReason::CacheFull)
+                // If the wft was just a legacy query, still reply, otherwise we might try to
+                // reply to the task as if it were a task rather than a query.
+                && !self.pending_work_is_legacy_query()
+            {
+                if let Some(wft) = self.wft.as_mut() {
+                    wft.pending_queries.clear();
+                }
+            }
+
             self.trying_to_evict = Some(info);
             EvictionRequestResult::EvictionRequested(attempts, self.check_more_activations())
         } else {
@@ -1166,6 +1205,60 @@ impl ManagedRun {
     }
 }
 
+// Construct a new command sequence with query responses removed, and any
+// terminal responses removed, except for the first terminal response, which is
+// placed at the end. Return new command sequence and query commands. Note that
+// multiple coroutines may have generated a terminal command, leading to
+// multiple terminal commands in the input to this function.
+fn preprocess_command_sequence(commands: Vec<WFCommand>) -> (Vec<WFCommand>, Vec<QueryResult>) {
+    let mut query_results = vec![];
+    let mut terminals = vec![];
+
+    let mut commands: Vec<_> = commands
+        .into_iter()
+        .filter_map(|c| {
+            if let WFCommand::QueryResponse(qr) = c {
+                query_results.push(qr);
+                None
+            } else if c.is_terminal() {
+                terminals.push(c);
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    if let Some(first_terminal) = terminals.into_iter().next() {
+        commands.push(first_terminal);
+    }
+    (commands, query_results)
+}
+
+fn preprocess_command_sequence_old_behavior(
+    commands: Vec<WFCommand>,
+) -> (Vec<WFCommand>, Vec<QueryResult>) {
+    let mut query_results = vec![];
+    let mut seen_terminal = false;
+
+    let commands: Vec<_> = commands
+        .into_iter()
+        .filter_map(|c| {
+            if let WFCommand::QueryResponse(qr) = c {
+                query_results.push(qr);
+                None
+            } else if seen_terminal {
+                None
+            } else {
+                if c.is_terminal() {
+                    seen_terminal = true;
+                }
+                Some(c)
+            }
+        })
+        .collect();
+    (commands, query_results)
+}
+
 /// Drains pending queries from the workflow task and appends them to the activation's jobs
 fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
     // Nothing to do if there are no pending queries
@@ -1379,8 +1472,8 @@ enum ActOrFulfill {
     FulfillableComplete(Option<FulfillableActivationComplete>),
 }
 
-#[derive(derive_more::DebugCustom)]
-#[debug(fmt = "RunUpdateErr({source:?})")]
+#[derive(derive_more::Debug)]
+#[debug("RunUpdateErr({source:?})")]
 struct RunUpdateErr {
     source: WFMachinesError,
     complete_resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
@@ -1391,6 +1484,132 @@ impl From<WFMachinesError> for RunUpdateErr {
         RunUpdateErr {
             source: e,
             complete_resp_chan: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worker::workflow::WFCommand;
+    use std::mem::{discriminant, Discriminant};
+
+    use command_utils::*;
+
+    #[rstest::rstest]
+    #[case::empty(
+        vec![],
+        vec![])]
+    #[case::non_terminal_is_retained(
+        vec![update_response()],
+        vec![update_response()])]
+    #[case::terminal_is_retained(
+        vec![complete()],
+        vec![complete()])]
+    #[case::post_terminal_is_retained(
+        vec![complete(), update_response()],
+        vec![update_response(), complete()])]
+    #[case::second_terminal_is_discarded(
+        vec![cancel(), complete()],
+        vec![cancel()])]
+    #[case::move_terminals_to_end_and_retain_first(
+        vec![update_response(), complete(), update_response(), cancel(), update_response()],
+        vec![update_response(), update_response(), update_response(), complete()])]
+    #[test]
+    fn preprocess_command_sequence(
+        #[case] commands_in: Vec<WFCommand>,
+        #[case] expected_commands: Vec<WFCommand>,
+    ) {
+        let (commands, _) = super::preprocess_command_sequence(commands_in);
+        assert_eq!(command_types(&commands), command_types(&expected_commands));
+    }
+
+    #[rstest::rstest]
+    #[case::query_responses_extracted(
+        vec![query_response(), update_response(), query_response(), complete(), query_response()],
+        3,
+    )]
+    #[test]
+    fn preprocess_command_sequence_extracts_queries(
+        #[case] commands_in: Vec<WFCommand>,
+        #[case] expected_queries_out: usize,
+    ) {
+        let (_, query_responses_out) = super::preprocess_command_sequence(commands_in);
+        assert_eq!(query_responses_out.len(), expected_queries_out);
+    }
+
+    #[rstest::rstest]
+    #[case::empty(
+        vec![],
+        vec![])]
+    #[case::non_terminal_is_retained(
+        vec![update_response()],
+        vec![update_response()])]
+    #[case::terminal_is_retained(
+        vec![complete()],
+        vec![complete()])]
+    #[case::post_terminal_is_discarded(
+        vec![complete(), update_response()],
+        vec![complete()])]
+    #[case::second_terminal_is_discarded(
+        vec![cancel(), complete()],
+        vec![cancel()])]
+    #[case::truncate_at_first_complete(
+        vec![update_response(), complete(), update_response(), cancel()],
+        vec![update_response(), complete()])]
+    #[test]
+    fn preprocess_command_sequence_old_behavior(
+        #[case] commands_in: Vec<WFCommand>,
+        #[case] expected_out: Vec<WFCommand>,
+    ) {
+        let (commands_out, _) = super::preprocess_command_sequence_old_behavior(commands_in);
+        assert_eq!(command_types(&commands_out), command_types(&expected_out));
+    }
+
+    #[rstest::rstest]
+    #[case::query_responses_extracted(
+        vec![query_response(), update_response(), query_response(), complete(), query_response()],
+        3,
+    )]
+    #[test]
+    fn preprocess_command_sequence_old_behavior_extracts_queries(
+        #[case] commands_in: Vec<WFCommand>,
+        #[case] expected_queries_out: usize,
+    ) {
+        let (_, query_responses_out) = super::preprocess_command_sequence_old_behavior(commands_in);
+        assert_eq!(query_responses_out.len(), expected_queries_out);
+    }
+
+    mod command_utils {
+        use temporal_sdk_core_protos::coresdk::workflow_commands::{
+            CancelWorkflowExecution, CompleteWorkflowExecution, QueryResult, UpdateResponse,
+        };
+
+        use super::*;
+
+        pub(crate) fn complete() -> WFCommand {
+            WFCommand::CompleteWorkflow(CompleteWorkflowExecution { result: None })
+        }
+
+        pub(crate) fn cancel() -> WFCommand {
+            WFCommand::CancelWorkflow(CancelWorkflowExecution {})
+        }
+
+        pub(crate) fn query_response() -> WFCommand {
+            WFCommand::QueryResponse(QueryResult {
+                query_id: "".into(),
+                variant: None,
+            })
+        }
+
+        pub(crate) fn update_response() -> WFCommand {
+            WFCommand::UpdateResponse(UpdateResponse {
+                protocol_instance_id: "".into(),
+                response: None,
+            })
+        }
+
+        pub(crate) fn command_types(commands: &[WFCommand]) -> Vec<Discriminant<WFCommand>> {
+            commands.iter().map(discriminant).collect()
         }
     }
 }

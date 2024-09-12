@@ -29,7 +29,7 @@ async fn client_list_open_closed_workflow_executions() {
     assert_matches!(
         task.jobs.as_slice(),
         [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::StartWorkflow(_)),
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
         }]
     );
 
@@ -97,7 +97,7 @@ async fn client_create_namespace() {
     );
 
     let register_options = RegisterNamespaceOptions::builder()
-        .namespace("test-create-namespace")
+        .namespace(uuid::Uuid::new_v4().to_string())
         .description("it's alive")
         .build()
         .unwrap();

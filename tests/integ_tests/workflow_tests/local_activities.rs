@@ -7,7 +7,7 @@ use std::{
 };
 use temporal_client::WorkflowOptions;
 use temporal_sdk::{
-    interceptors::WorkerInterceptor, ActContext, ActivityCancelledError, CancellableFuture,
+    interceptors::WorkerInterceptor, ActContext, ActivityError, ActivityOptions, CancellableFuture,
     LocalActivityOptions, WfContext, WorkflowResult,
 };
 use temporal_sdk_core::replay::HistoryForReplay;
@@ -47,8 +47,13 @@ async fn one_local_activity() {
     worker.register_wf(wf_name.to_owned(), one_local_activity_wf);
     worker.register_activity("echo_activity", echo);
 
-    starter.start_with_worker(wf_name, &mut worker).await;
+    let run_id = starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
+    let tq = starter.get_task_queue().to_string();
+    starter
+        .fetch_history_and_replay(tq, run_id, worker.inner_mut())
+        .await
+        .unwrap();
 }
 
 pub(crate) async fn local_act_concurrent_with_timer_wf(ctx: WfContext) -> WorkflowResult<()> {
@@ -135,7 +140,9 @@ pub(crate) async fn local_act_fanout_wf(ctx: WfContext) -> WorkflowResult<()> {
 async fn local_act_fanout() {
     let wf_name = "local_act_fanout";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.max_local_at(1);
+    starter
+        .worker_config
+        .max_outstanding_local_activities(1_usize);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_fanout_wf);
     worker.register_activity("echo_activity", echo);
@@ -170,7 +177,7 @@ async fn local_act_retry_timer_backoff() {
         Ok(().into())
     });
     worker.register_activity("echo", |_: ActContext, _: String| async {
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        Result::<(), _>::Err(anyhow!("Oh no I failed!").into())
     });
 
     let run_id = worker
@@ -221,7 +228,7 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {},
                 _ = ctx.cancelled() => {
-                    return Err(anyhow!(ActivityCancelledError::default()))
+                    return Err(ActivityError::cancelled())
                 }
                 _ = manual_cancel_act.cancelled() => {}
             }
@@ -324,22 +331,22 @@ async fn cancel_after_act_starts(
         async move {
             if cancel_on_backoff.is_some() {
                 if ctx.is_cancelled() {
-                    return Err(anyhow!(ActivityCancelledError::default()));
+                    return Err(ActivityError::cancelled());
                 }
                 // Just fail constantly so we get stuck on the backoff timer
-                return Err(anyhow!("Oh no I failed!"));
+                return Err(anyhow!("Oh no I failed!").into());
             } else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(100)) => {},
                     _ = ctx.cancelled() => {
-                        return Err(anyhow!(ActivityCancelledError::default()))
+                        return Err(ActivityError::cancelled())
                     }
                     _ = manual_cancel_act.cancelled() => {
                         return Ok(())
                     }
                 }
             }
-            Err(anyhow!("Oh no I failed!"))
+            Err(anyhow!("Oh no I failed!").into())
         }
     });
 
@@ -403,7 +410,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(100)) => {},
             _ = ctx.cancelled() => {
-                return Err(anyhow!(ActivityCancelledError::default()))
+                return Err(ActivityError::cancelled())
             }
         };
         Ok(())
@@ -424,7 +431,7 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
     );
     let mut starter = CoreWfStarter::new(&wf_name);
     if !cached {
-        starter.max_cached_workflows(0);
+        starter.worker_config.max_cached_workflows(0_usize);
     }
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), |ctx: WfContext| async move {
@@ -450,7 +457,7 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
     let num_attempts: &'static _ = Box::leak(Box::new(AtomicU8::new(0)));
     worker.register_activity("echo", move |_: ActContext, _: String| async {
         num_attempts.fetch_add(1, Ordering::Relaxed);
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        Result::<(), _>::Err(anyhow!("Oh no I failed!").into())
     });
 
     starter.start_with_worker(wf_name, &mut worker).await;
@@ -465,7 +472,7 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
 async fn eviction_wont_make_local_act_get_dropped(#[values(true, false)] short_wft_timeout: bool) {
     let wf_name = format!("eviction_wont_make_local_act_get_dropped_{short_wft_timeout}");
     let mut starter = CoreWfStarter::new(&wf_name);
-    starter.max_cached_workflows(0);
+    starter.worker_config.max_cached_workflows(0_usize);
     let mut worker = starter.worker().await;
     worker.register_wf(wf_name.to_owned(), local_act_then_timer_then_wait);
     worker.register_activity("echo_activity", |_ctx: ActContext, str: String| async {
@@ -526,7 +533,7 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
         Ok(().into())
     });
     worker.register_activity("echo", |_: ActContext, _: String| async {
-        Result::<(), _>::Err(anyhow!("Oh no I failed!"))
+        Result::<(), _>::Err(anyhow!("Oh no I failed!").into())
     });
 
     starter.start_with_worker(wf_name, &mut worker).await;
@@ -660,4 +667,78 @@ async fn third_weird_la_nondeterminism_repro() {
         Ok(())
     });
     worker.run().await.unwrap();
+}
+
+/// This test demonstrates why it's important to send LA resolutions last within a job.
+/// If we were to (during replay) scan ahead, see the marker, and resolve the LA before the
+/// activity cancellation, that would be wrong because, during execution, the LA resolution is
+/// always going to take _longer_ than the instantaneous cancel effect.
+///
+/// This affect applies regardless of how you choose to interleave cancellations and LAs. Ultimately
+/// all cancellations will happen at once (in the order they are submitted) while the LA executions
+/// are queued (because this all happens synchronously in the workflow machines). If you were to
+/// _wait_ on an LA, and then cancel something else, and then run another LA, such that all commands
+/// happened in the same workflow task, it would _still_ be fine to sort LA jobs last _within_ the
+/// 2 activations that would necessarily entail (because, one you wait on the LA result, control
+/// will be yielded and it will take another activation to unblock that LA).
+#[tokio::test]
+async fn la_resolve_same_time_as_other_cancel() {
+    let wf_name = "la_resolve_same_time_as_other_cancel";
+    let mut starter = CoreWfStarter::new(wf_name);
+    // The activity won't get a chance to receive the cancel so make sure we still exit fast
+    starter
+        .worker_config
+        .graceful_shutdown_period(Duration::from_millis(100));
+    let mut worker = starter.worker().await;
+
+    worker.register_wf(wf_name.to_owned(), |ctx: WfContext| async move {
+        let normal_act = ctx.activity(ActivityOptions {
+            activity_type: "delay".to_string(),
+            input: 9000.as_json_payload().expect("serializes fine"),
+            cancellation_type: ActivityCancellationType::TryCancel,
+            start_to_close_timeout: Some(Duration::from_secs(9000)),
+            ..Default::default()
+        });
+        // Make new task
+        ctx.timer(Duration::from_millis(1)).await;
+
+        // Start LA and cancel the activity at the same time
+        let local_act = ctx.local_activity(LocalActivityOptions {
+            activity_type: "delay".to_string(),
+            input: 100.as_json_payload().expect("serializes fine"),
+            ..Default::default()
+        });
+        normal_act.cancel(&ctx);
+        // Race them, starting a timer if LA completes first
+        tokio::select! {
+            biased;
+            _ = normal_act => {},
+            _ = local_act => {
+                ctx.timer(Duration::from_millis(1)).await;
+            },
+        }
+        Ok(().into())
+    });
+    worker.register_activity("delay", |ctx: ActContext, wait_time: u64| async move {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(wait_time)) => {}
+            _ = ctx.cancelled() => {}
+        }
+        Ok(())
+    });
+
+    let run_id = worker
+        .submit_wf(
+            wf_name.to_owned(),
+            wf_name.to_owned(),
+            vec![],
+            WorkflowOptions::default(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    starter
+        .fetch_history_and_replay(wf_name, run_id, worker.inner_mut())
+        .await
+        .unwrap();
 }

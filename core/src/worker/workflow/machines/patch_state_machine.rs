@@ -46,7 +46,6 @@ use temporal_sdk_core_protos::{
         },
         common::v1::SearchAttributes,
         enums::v1::CommandType,
-        history::v1::HistoryEvent,
     },
 };
 
@@ -115,6 +114,7 @@ pub(super) fn has_change<'a>(
             }
             .into(),
         ),
+        user_metadata: Default::default(),
     };
     let mut machine = PatchMachine::from_parts(initial_state, shared_state);
 
@@ -236,10 +236,6 @@ impl WFMachinesAdapter for PatchMachine {
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, WFMachinesError> {
         panic!("Patch machine does not produce commands")
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        event.get_patch_marker_details().is_some()
     }
 }
 
@@ -555,10 +551,11 @@ mod tests {
 
         let mut aai = ActivationAssertionsInterceptor::default();
         aai.then(move |act| {
-            // replaying cases should immediately get a resolve change activation when marker is present
+            // replaying cases should immediately get a resolve change activation when marker is
+            // present
             if replaying && marker_type != MarkerType::NoMarker {
                 assert_matches!(
-                    &act.jobs[0],
+                    &act.jobs[1],
                      WorkflowActivationJob {
                         variant: Some(workflow_activation_job::Variant::NotifyHasPatch(
                             NotifyHasPatch {

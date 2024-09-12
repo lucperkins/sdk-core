@@ -1,11 +1,16 @@
 use assert_matches::assert_matches;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use temporal_client::{WorkflowClientTrait, WorkflowOptions, WorkflowService};
-use temporal_sdk_core::{init_worker, telemetry::start_prometheus_metric_exporter, CoreRuntime};
+use temporal_sdk_core::{
+    init_worker,
+    telemetry::{build_otlp_metric_exporter, start_prometheus_metric_exporter},
+    CoreRuntime,
+};
 use temporal_sdk_core_api::{
     telemetry::{
         metrics::{CoreMeter, MetricAttributes, MetricParameters},
-        PrometheusExporterOptionsBuilder, TelemetryOptions,
+        OtelCollectorOptionsBuilder, PrometheusExporterOptionsBuilder, TelemetryOptions,
+        TelemetryOptionsBuilder,
     },
     worker::WorkerConfigBuilder,
     Worker,
@@ -23,14 +28,17 @@ use temporal_sdk_core_protos::{
         ActivityTaskCompletion,
     },
     temporal::api::{
-        enums::v1::WorkflowIdReusePolicy, failure::v1::Failure, query::v1::WorkflowQuery,
-        workflowservice::v1::ListNamespacesRequest,
+        enums::v1::WorkflowIdReusePolicy,
+        failure::v1::Failure,
+        query::v1::WorkflowQuery,
+        workflowservice::v1::{DescribeNamespaceRequest, ListNamespacesRequest},
     },
 };
 use temporal_sdk_core_test_utils::{
-    get_integ_server_options, get_integ_telem_options, CoreWfStarter, NAMESPACE,
+    get_integ_server_options, get_integ_telem_options, CoreWfStarter, NAMESPACE, OTEL_URL_ENV_VAR,
 };
 use tokio::{join, sync::Barrier, task::AbortHandle};
+use url::Url;
 
 static ANY_PORT: &str = "127.0.0.1:0";
 
@@ -253,8 +261,7 @@ async fn one_slot_worker_reports_available_slot() {
 
         wf_task_barr.wait().await;
 
-        // At this point the workflow task is outstanding, so there should be 0 slots, and
-        // the activities haven't started, so there should still be 1 each.
+        // At this point the workflow task is outstanding and the activities haven't started
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
             "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
@@ -271,8 +278,23 @@ async fn one_slot_worker_reports_available_slot() {
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 1"
         )));
+        assert!(body.contains(&format!(
+            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
+             worker_type=\"WorkflowWorker\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
+             worker_type=\"ActivityWorker\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
+             worker_type=\"LocalActivityWorker\"}} 0"
+        )));
 
-        // Now we allow the complete to proceed. Once it goes through, there should be 1 WFT slot
+        // Now we allow the complete to proceed. Once it goes through, there should be 2 WFT slot
         // open but 0 activity slots
         wf_task_barr.wait().await;
         wf_task_barr.wait().await;
@@ -288,6 +310,11 @@ async fn one_slot_worker_reports_available_slot() {
             "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
+             worker_type=\"ActivityWorker\"}} 1"
         )));
 
         // Now complete the activity and watch it go up
@@ -309,6 +336,11 @@ async fn one_slot_worker_reports_available_slot() {
             "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
+             worker_type=\"LocalActivityWorker\"}} 1"
         )));
         // When completion is done, we have 1 again
         act_task_barr.wait().await;
@@ -341,7 +373,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
     let mut starter =
         CoreWfStarter::new_with_runtime("query_of_closed_workflow_doesnt_tick_terminal_metric", rt);
     // Disable cache to ensure replay happens completely
-    starter.max_cached_workflows(0);
+    starter.worker_config.max_cached_workflows(0_usize);
     let worker = starter.get_worker().await;
     let run_id = starter.start_wf().await;
     let task = worker.poll_workflow_activation().await.unwrap();
@@ -350,6 +382,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
         .complete_workflow_activation(WorkflowActivationCompletion::fail(
             task.run_id,
             "whatever".into(),
+            None,
         ))
         .await
         .unwrap();
@@ -521,5 +554,69 @@ async fn latency_metrics(
             assert!(matching_line.contains("temporal_workflow_endtoend_latency_milliseconds"));
         }
         assert!(matching_line.contains("le=\"100\""));
+    }
+}
+
+#[tokio::test]
+async fn request_fail_codes() {
+    let (telemopts, addr, _aborter) = prom_metrics(false, false);
+    let rt = CoreRuntime::new_assume_tokio(telemopts).unwrap();
+    let opts = get_integ_server_options();
+    let mut client = opts
+        .connect(NAMESPACE, rt.telemetry().get_temporal_metric_meter())
+        .await
+        .unwrap();
+
+    // Describe namespace w/ invalid argument (unset namespace field)
+    WorkflowService::describe_namespace(&mut client, DescribeNamespaceRequest::default())
+        .await
+        .unwrap_err();
+
+    let body = get_text(format!("http://{addr}/metrics")).await;
+    let matching_line = body
+        .lines()
+        .find(|l| l.starts_with("temporal_request_failure"))
+        .unwrap();
+    assert!(matching_line.contains("operation=\"DescribeNamespace\""));
+    assert!(matching_line.contains("status_code=\"INVALID_ARGUMENT\""));
+    assert!(matching_line.contains("} 1"));
+}
+
+// OTel collector shutdown hangs in a single-threaded Tokio environment. We used to, in the past
+// have a dedicated runtime just for telemetry which was meant to address problems like this.
+// In reality, users are unlikely to run a single-threaded runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_fail_codes_otel() {
+    let exporter = if let Some(url) = env::var(OTEL_URL_ENV_VAR)
+        .ok()
+        .map(|x| x.parse::<Url>().unwrap())
+    {
+        let opts = OtelCollectorOptionsBuilder::default()
+            .url(url)
+            .build()
+            .unwrap();
+        build_otlp_metric_exporter(opts).unwrap()
+    } else {
+        // skip
+        return;
+    };
+    let mut telemopts = TelemetryOptionsBuilder::default();
+    let exporter = Arc::new(exporter);
+    telemopts.metrics(exporter as Arc<dyn CoreMeter>);
+
+    let rt = CoreRuntime::new_assume_tokio(telemopts.build().unwrap()).unwrap();
+    let opts = get_integ_server_options();
+    let mut client = opts
+        .connect(NAMESPACE, rt.telemetry().get_temporal_metric_meter())
+        .await
+        .unwrap();
+
+    for _ in 0..10 {
+        // Describe namespace w/ invalid argument (unset namespace field)
+        WorkflowService::describe_namespace(&mut client, DescribeNamespaceRequest::default())
+            .await
+            .unwrap_err();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

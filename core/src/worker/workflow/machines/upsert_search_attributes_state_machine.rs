@@ -15,8 +15,8 @@ use temporal_sdk_core_protos::{
     temporal::api::{
         command::v1::{command, Command, UpsertWorkflowSearchAttributesCommandAttributes},
         common::v1::SearchAttributes,
-        enums::v1::{CommandType, EventType},
-        history::v1::{history_event, HistoryEvent},
+        enums::v1::CommandType,
+        history::v1::history_event,
     },
 };
 
@@ -86,6 +86,7 @@ fn create_new(sa_map: SearchAttributes) -> NewMachineWithCommand {
                 },
             ),
         ),
+        user_metadata: Default::default(),
     };
     NewMachineWithCommand {
         command: cmd,
@@ -136,14 +137,6 @@ impl WFMachinesAdapter for UpsertSearchAttributesMachine {
         Err(Self::Error::Nondeterminism(
             "UpsertWorkflowSearchAttributesMachine does not use commands".to_string(),
         ))
-    }
-
-    /// Filters for EventType::UpsertWorkflowSearchAttributes
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::UpsertWorkflowSearchAttributes
-        )
     }
 }
 
@@ -214,8 +207,10 @@ mod tests {
             AsJsonPayloadExt,
         },
         temporal::api::{
-            command::v1::command::Attributes, common::v1::Payload,
-            history::v1::UpsertWorkflowSearchAttributesEventAttributes,
+            command::v1::command::Attributes,
+            common::v1::Payload,
+            enums::v1::EventType,
+            history::v1::{HistoryEvent, UpsertWorkflowSearchAttributesEventAttributes},
         },
         DEFAULT_WORKFLOW_TYPE,
     };
@@ -291,7 +286,6 @@ mod tests {
             ),
             ..Default::default()
         };
-        assert!(sm.matches_event(&recorded_history_event));
         let cmd_recorded_sm_event = HistEventData {
             event: recorded_history_event,
             replaying: false,
@@ -346,7 +340,7 @@ mod tests {
         );
         // Ensure the upsert command has an empty map when not using the patched command
         if !with_patched_cmd {
-            mp.completion_asserts = Some(Box::new(|wftc| {
+            mp.completion_mock_fn = Some(Box::new(|wftc| {
                 let cmd_attrs = wftc
                     .commands
                     .first()
@@ -356,11 +350,12 @@ mod tests {
                     cmd_attrs,
                     Attributes::CompleteWorkflowExecutionCommandAttributes(_)
                 ) {
-                    return;
+                    return Ok(Default::default());
                 }
                 assert_matches!(cmd_attrs,
                     Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs)
                     if attrs.search_attributes.clone().unwrap_or_default().indexed_fields.is_empty());
+                Ok(Default::default())
             }));
         }
         let mut mock = build_mock_pollers(mp);

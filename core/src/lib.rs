@@ -38,7 +38,12 @@ pub use temporal_sdk_core_api as api;
 pub use temporal_sdk_core_protos as protos;
 pub use temporal_sdk_core_protos::TaskToken;
 pub use url::Url;
-pub use worker::{Worker, WorkerConfig, WorkerConfigBuilder};
+pub use worker::{
+    FixedSizeSlotSupplier, RealSysInfo, ResourceBasedSlotsOptions,
+    ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner, ResourceSlotOptions, SlotSupplierOptions,
+    TunerBuilder, TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
+    WorkerConfigBuilder,
+};
 
 use crate::{
     replay::{HistoryForReplay, ReplayWorkerInput},
@@ -48,6 +53,7 @@ use crate::{
     },
     worker::client::WorkerClientBag,
 };
+use anyhow::bail;
 use futures::Stream;
 use std::sync::Arc;
 use temporal_client::{ConfiguredClient, TemporalServiceClientWithMetrics};
@@ -79,7 +85,10 @@ where
 {
     let client = init_worker_client(&worker_config, *client.into().into_inner());
     if client.namespace() != worker_config.namespace {
-        panic!("Passed in client is not bound to the same namespace as the worker");
+        bail!("Passed in client is not bound to the same namespace as the worker");
+    }
+    if client.namespace() == "" {
+        bail!("Namespace cannot be empty");
     }
     let client_ident = client.get_options().identity.clone();
     let sticky_q = sticky_q_name_for_worker(&client_ident, &worker_config);
@@ -122,7 +131,7 @@ pub(crate) fn init_worker_client(
 ) -> RetryClient<Client> {
     let mut client = Client::new(client, config.namespace.clone());
     if let Some(ref id_override) = config.client_identity_override {
-        client.options_mut().identity = id_override.clone();
+        client.options_mut().identity.clone_from(id_override);
     }
     RetryClient::new(client, RetryConfig::default())
 }

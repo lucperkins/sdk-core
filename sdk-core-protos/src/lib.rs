@@ -436,11 +436,12 @@ pub mod coresdk {
     pub mod workflow_activation {
         use crate::{
             coresdk::{
+                activity_result::{activity_resolution, ActivityResolution},
                 common::NamespacedWorkflowExecution,
-                workflow_activation::remove_from_cache::EvictionReason, FromPayloadsExt,
+                workflow_activation::remove_from_cache::EvictionReason,
+                FromPayloadsExt,
             },
             temporal::api::{
-                common::v1::Header,
                 enums::v1::WorkflowTaskFailedCause,
                 history::v1::{
                     WorkflowExecutionCancelRequestedEventAttributes,
@@ -451,10 +452,7 @@ pub mod coresdk {
             },
         };
         use prost_wkt_types::Timestamp;
-        use std::{
-            collections::HashMap,
-            fmt::{Display, Formatter},
-        };
+        use std::fmt::{Display, Formatter};
 
         tonic::include_proto!("coresdk.workflow_activation");
 
@@ -515,6 +513,12 @@ pub mod coresdk {
             }
         }
 
+        impl workflow_activation_job::Variant {
+            pub fn is_local_activity_resolution(&self) -> bool {
+                matches!(self, workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local)
+            }
+        }
+
         impl Display for EvictionReason {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 write!(f, "{self:?}")
@@ -562,8 +566,8 @@ pub mod coresdk {
         impl Display for workflow_activation_job::Variant {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 match self {
-                    workflow_activation_job::Variant::StartWorkflow(_) => {
-                        write!(f, "StartWorkflow")
+                    workflow_activation_job::Variant::InitializeWorkflow(_) => {
+                        write!(f, "InitializeWorkflow")
                     }
                     workflow_activation_job::Variant::FireTimer(t) => {
                         write!(f, "FireTimer({})", t.seq)
@@ -581,7 +585,14 @@ pub mod coresdk {
                         write!(f, "SignalWorkflow")
                     }
                     workflow_activation_job::Variant::ResolveActivity(r) => {
-                        write!(f, "ResolveActivity({})", r.seq)
+                        write!(
+                            f,
+                            "ResolveActivity({}, {})",
+                            r.seq,
+                            r.result
+                                .as_ref()
+                                .unwrap_or_else(|| &ActivityResolution { status: None })
+                        )
                     }
                     workflow_activation_job::Variant::NotifyHasPatch(_) => {
                         write!(f, "NotifyHasPatch")
@@ -603,6 +614,28 @@ pub mod coresdk {
                     }
                     workflow_activation_job::Variant::DoUpdate(_) => {
                         write!(f, "DoUpdate")
+                    }
+                }
+            }
+        }
+
+        impl Display for ActivityResolution {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                match self.status {
+                    None => {
+                        write!(f, "None")
+                    }
+                    Some(activity_resolution::Status::Failed(_)) => {
+                        write!(f, "Failed")
+                    }
+                    Some(activity_resolution::Status::Completed(_)) => {
+                        write!(f, "Completed")
+                    }
+                    Some(activity_resolution::Status::Cancelled(_)) => {
+                        write!(f, "Cancelled")
+                    }
+                    Some(activity_resolution::Status::Backoff(_)) => {
+                        write!(f, "Backoff")
                     }
                 }
             }
@@ -635,22 +668,19 @@ pub mod coresdk {
             }
         }
 
-        /// Create a [StartWorkflow] job from corresponding event attributes
+        /// Create a [InitializeWorkflow] job from corresponding event attributes
         pub fn start_workflow_from_attribs(
             attrs: WorkflowExecutionStartedEventAttributes,
             workflow_id: String,
             randomness_seed: u64,
             start_time: Timestamp,
-        ) -> StartWorkflow {
-            StartWorkflow {
+        ) -> InitializeWorkflow {
+            InitializeWorkflow {
                 workflow_type: attrs.workflow_type.map(|wt| wt.name).unwrap_or_default(),
                 workflow_id,
                 arguments: Vec::from_payloads(attrs.input),
                 randomness_seed,
-                headers: match attrs.header {
-                    None => HashMap::new(),
-                    Some(Header { fields }) => fields,
-                },
+                headers: attrs.header.unwrap_or_default().fields,
                 identity: attrs.identity,
                 parent_workflow_info: attrs.parent_workflow_execution.map(|pe| {
                     NamespacedWorkflowExecution {
@@ -957,13 +987,17 @@ pub mod coresdk {
             }
         }
 
-        pub fn fail(run_id: impl Into<String>, failure: Failure) -> Self {
+        pub fn fail(
+            run_id: impl Into<String>,
+            failure: Failure,
+            cause: Option<WorkflowTaskFailedCause>,
+        ) -> Self {
             Self {
                 run_id: run_id.into(),
                 status: Some(workflow_activation_completion::Status::Failed(
                     workflow_completion::Failure {
                         failure: Some(failure),
-                        force_cause: WorkflowTaskFailedCause::Unspecified as i32,
+                        force_cause: cause.unwrap_or(WorkflowTaskFailedCause::Unspecified) as i32,
                     },
                 )),
             }
@@ -1249,6 +1283,13 @@ pub mod coresdk {
                         v.started_event_id
                     )?;
                 }
+                Some(FailureInfo::NexusOperationExecutionFailureInfo(v)) => {
+                    write!(
+                        f,
+                        "Nexus Operation Failure: scheduled_event_id: {}",
+                        v.scheduled_event_id
+                    )?;
+                }
             }
             write!(f, ")")
         }
@@ -1431,45 +1472,55 @@ pub mod temporal {
                             a @ Attributes::StartTimerCommandAttributes(_) => Self {
                                 command_type: CommandType::StartTimer as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::CancelTimerCommandAttributes(_) => Self {
                                 command_type: CommandType::CancelTimer as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::CompleteWorkflowExecutionCommandAttributes(_) => Self {
                                 command_type: CommandType::CompleteWorkflowExecution as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::FailWorkflowExecutionCommandAttributes(_) => Self {
                                 command_type: CommandType::FailWorkflowExecution as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::ScheduleActivityTaskCommandAttributes(_) => Self {
                                 command_type: CommandType::ScheduleActivityTask as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::RequestCancelActivityTaskCommandAttributes(_) => Self {
                                 command_type: CommandType::RequestCancelActivityTask as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(_) => {
                                 Self {
                                     command_type: CommandType::ContinueAsNewWorkflowExecution
                                         as i32,
                                     attributes: Some(a),
+                                    user_metadata: Default::default(),
                                 }
                             }
                             a @ Attributes::CancelWorkflowExecutionCommandAttributes(_) => Self {
                                 command_type: CommandType::CancelWorkflowExecution as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::RecordMarkerCommandAttributes(_) => Self {
                                 command_type: CommandType::RecordMarker as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             a @ Attributes::ProtocolMessageCommandAttributes(_) => Self {
                                 command_type: CommandType::ProtocolMessage as i32,
                                 attributes: Some(a),
+                                user_metadata: Default::default(),
                             },
                             _ => unimplemented!(),
                         }
@@ -1523,7 +1574,7 @@ pub mod temporal {
 
                 pub fn schedule_activity_cmd_to_api(
                     s: workflow_commands::ScheduleActivity,
-                    use_compatible_version: bool,
+                    use_workflow_build_id: bool,
                 ) -> command::Attributes {
                     command::Attributes::ScheduleActivityTaskCommandAttributes(
                         ScheduleActivityTaskCommandAttributes {
@@ -1540,14 +1591,14 @@ pub mod temporal {
                             heartbeat_timeout: s.heartbeat_timeout,
                             retry_policy: s.retry_policy.map(Into::into),
                             request_eager_execution: !s.do_not_eagerly_execute,
-                            use_compatible_version,
+                            use_workflow_build_id,
                         },
                     )
                 }
 
                 pub fn start_child_workflow_cmd_to_api(
                     s: workflow_commands::StartChildWorkflowExecution,
-                    use_compatible_version: bool,
+                    inherit_build_id: bool,
                 ) -> command::Attributes {
                     command::Attributes::StartChildWorkflowExecutionCommandAttributes(
                         StartChildWorkflowExecutionCommandAttributes {
@@ -1569,7 +1620,7 @@ pub mod temporal {
                             retry_policy: s.retry_policy.map(Into::into),
                             cron_schedule: s.cron_schedule.clone(),
                             parent_close_policy: s.parent_close_policy,
-                            use_compatible_version,
+                            inherit_build_id,
                         },
                     )
                 }
@@ -1596,7 +1647,7 @@ pub mod temporal {
 
                 pub fn continue_as_new_cmd_to_api(
                     c: workflow_commands::ContinueAsNewWorkflowExecution,
-                    use_compatible_version: bool,
+                    inherit_build_id: bool,
                 ) -> command::Attributes {
                     command::Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
                         ContinueAsNewWorkflowExecutionCommandAttributes {
@@ -1621,7 +1672,7 @@ pub mod temporal {
                             } else {
                                 Some(c.search_attributes.into())
                             },
-                            use_compatible_version,
+                            inherit_build_id,
                             ..Default::default()
                         },
                     )
@@ -1633,6 +1684,33 @@ pub mod temporal {
                             CancelWorkflowExecutionCommandAttributes { details: None },
                         )
                     }
+                }
+            }
+        }
+        pub mod cloud {
+            pub mod cloudservice {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.cloudservice.v1");
+                }
+            }
+            pub mod identity {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.identity.v1");
+                }
+            }
+            pub mod namespace {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.namespace.v1");
+                }
+            }
+            pub mod operation {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.operation.v1");
+                }
+            }
+            pub mod region {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.region.v1");
                 }
             }
         }
@@ -1913,7 +1991,7 @@ pub mod temporal {
                             f,
                             "HistoryEvent(id: {}, {:?})",
                             self.event_id,
-                            EventType::try_from(self.event_type)
+                            EventType::try_from(self.event_type).unwrap_or_default()
                         )
                     }
                 }
@@ -1922,53 +2000,60 @@ pub mod temporal {
                     pub fn event_type(&self) -> EventType {
                         // I just absolutely _love_ this
                         match self {
-                            Attributes::WorkflowExecutionStartedEventAttributes(_) => {EventType::WorkflowExecutionStarted}
-                            Attributes::WorkflowExecutionCompletedEventAttributes(_) => {EventType::WorkflowExecutionCompleted}
-                            Attributes::WorkflowExecutionFailedEventAttributes(_) => {EventType::WorkflowExecutionFailed}
-                            Attributes::WorkflowExecutionTimedOutEventAttributes(_) => {EventType::WorkflowExecutionTimedOut}
-                            Attributes::WorkflowTaskScheduledEventAttributes(_) => {EventType::WorkflowTaskScheduled}
-                            Attributes::WorkflowTaskStartedEventAttributes(_) => {EventType::WorkflowTaskStarted}
-                            Attributes::WorkflowTaskCompletedEventAttributes(_) => {EventType::WorkflowTaskCompleted}
-                            Attributes::WorkflowTaskTimedOutEventAttributes(_) => {EventType::WorkflowTaskTimedOut}
-                            Attributes::WorkflowTaskFailedEventAttributes(_) => {EventType::WorkflowTaskFailed}
-                            Attributes::ActivityTaskScheduledEventAttributes(_) => {EventType::ActivityTaskScheduled}
-                            Attributes::ActivityTaskStartedEventAttributes(_) => {EventType::ActivityTaskStarted}
-                            Attributes::ActivityTaskCompletedEventAttributes(_) => {EventType::ActivityTaskCompleted}
-                            Attributes::ActivityTaskFailedEventAttributes(_) => {EventType::ActivityTaskFailed}
-                            Attributes::ActivityTaskTimedOutEventAttributes(_) => {EventType::ActivityTaskTimedOut}
-                            Attributes::TimerStartedEventAttributes(_) => {EventType::TimerStarted}
-                            Attributes::TimerFiredEventAttributes(_) => {EventType::TimerFired}
-                            Attributes::ActivityTaskCancelRequestedEventAttributes(_) => {EventType::ActivityTaskCancelRequested}
-                            Attributes::ActivityTaskCanceledEventAttributes(_) => {EventType::ActivityTaskCanceled}
-                            Attributes::TimerCanceledEventAttributes(_) => {EventType::TimerCanceled}
-                            Attributes::MarkerRecordedEventAttributes(_) => {EventType::MarkerRecorded}
-                            Attributes::WorkflowExecutionSignaledEventAttributes(_) => {EventType::WorkflowExecutionSignaled}
-                            Attributes::WorkflowExecutionTerminatedEventAttributes(_) => {EventType::WorkflowExecutionTerminated}
-                            Attributes::WorkflowExecutionCancelRequestedEventAttributes(_) => {EventType::WorkflowExecutionCancelRequested}
-                            Attributes::WorkflowExecutionCanceledEventAttributes(_) => {EventType::WorkflowExecutionCanceled}
-                            Attributes::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(_) => {EventType::RequestCancelExternalWorkflowExecutionInitiated}
-                            Attributes::RequestCancelExternalWorkflowExecutionFailedEventAttributes(_) => {EventType::RequestCancelExternalWorkflowExecutionFailed}
-                            Attributes::ExternalWorkflowExecutionCancelRequestedEventAttributes(_) => {EventType::ExternalWorkflowExecutionCancelRequested}
-                            Attributes::WorkflowExecutionContinuedAsNewEventAttributes(_) => {EventType::WorkflowExecutionContinuedAsNew}
-                            Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(_) => {EventType::StartChildWorkflowExecutionInitiated}
-                            Attributes::StartChildWorkflowExecutionFailedEventAttributes(_) => {EventType::StartChildWorkflowExecutionFailed}
-                            Attributes::ChildWorkflowExecutionStartedEventAttributes(_) => {EventType::ChildWorkflowExecutionStarted}
-                            Attributes::ChildWorkflowExecutionCompletedEventAttributes(_) => {EventType::ChildWorkflowExecutionCompleted}
-                            Attributes::ChildWorkflowExecutionFailedEventAttributes(_) => {EventType::ChildWorkflowExecutionFailed}
-                            Attributes::ChildWorkflowExecutionCanceledEventAttributes(_) => {EventType::ChildWorkflowExecutionCanceled}
-                            Attributes::ChildWorkflowExecutionTimedOutEventAttributes(_) => {EventType::ChildWorkflowExecutionTimedOut}
-                            Attributes::ChildWorkflowExecutionTerminatedEventAttributes(_) => {EventType::ChildWorkflowExecutionTerminated}
-                            Attributes::SignalExternalWorkflowExecutionInitiatedEventAttributes(_) => {EventType::SignalExternalWorkflowExecutionInitiated}
-                            Attributes::SignalExternalWorkflowExecutionFailedEventAttributes(_) => {EventType::SignalExternalWorkflowExecutionFailed}
-                            Attributes::ExternalWorkflowExecutionSignaledEventAttributes(_) => {EventType::ExternalWorkflowExecutionSignaled}
-                            Attributes::UpsertWorkflowSearchAttributesEventAttributes(_) => {EventType::UpsertWorkflowSearchAttributes}
-                            Attributes::WorkflowExecutionUpdateRejectedEventAttributes(_) => {EventType::WorkflowExecutionUpdateRejected}
-                            Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(_) => {EventType::WorkflowExecutionUpdateAccepted}
-                            Attributes::WorkflowExecutionUpdateCompletedEventAttributes(_) => {EventType::WorkflowExecutionUpdateCompleted}
-                            Attributes::WorkflowExecutionUpdateRequestedEventAttributes(_) => {EventType::WorkflowExecutionUpdateRequested}
-                            Attributes::WorkflowPropertiesModifiedExternallyEventAttributes(_) => {EventType::WorkflowPropertiesModifiedExternally}
-                            Attributes::ActivityPropertiesModifiedExternallyEventAttributes(_) => {EventType::ActivityPropertiesModifiedExternally}
-                            Attributes::WorkflowPropertiesModifiedEventAttributes(_) => {EventType::WorkflowPropertiesModified}
+                            Attributes::WorkflowExecutionStartedEventAttributes(_) => { EventType::WorkflowExecutionStarted }
+                            Attributes::WorkflowExecutionCompletedEventAttributes(_) => { EventType::WorkflowExecutionCompleted }
+                            Attributes::WorkflowExecutionFailedEventAttributes(_) => { EventType::WorkflowExecutionFailed }
+                            Attributes::WorkflowExecutionTimedOutEventAttributes(_) => { EventType::WorkflowExecutionTimedOut }
+                            Attributes::WorkflowTaskScheduledEventAttributes(_) => { EventType::WorkflowTaskScheduled }
+                            Attributes::WorkflowTaskStartedEventAttributes(_) => { EventType::WorkflowTaskStarted }
+                            Attributes::WorkflowTaskCompletedEventAttributes(_) => { EventType::WorkflowTaskCompleted }
+                            Attributes::WorkflowTaskTimedOutEventAttributes(_) => { EventType::WorkflowTaskTimedOut }
+                            Attributes::WorkflowTaskFailedEventAttributes(_) => { EventType::WorkflowTaskFailed }
+                            Attributes::ActivityTaskScheduledEventAttributes(_) => { EventType::ActivityTaskScheduled }
+                            Attributes::ActivityTaskStartedEventAttributes(_) => { EventType::ActivityTaskStarted }
+                            Attributes::ActivityTaskCompletedEventAttributes(_) => { EventType::ActivityTaskCompleted }
+                            Attributes::ActivityTaskFailedEventAttributes(_) => { EventType::ActivityTaskFailed }
+                            Attributes::ActivityTaskTimedOutEventAttributes(_) => { EventType::ActivityTaskTimedOut }
+                            Attributes::TimerStartedEventAttributes(_) => { EventType::TimerStarted }
+                            Attributes::TimerFiredEventAttributes(_) => { EventType::TimerFired }
+                            Attributes::ActivityTaskCancelRequestedEventAttributes(_) => { EventType::ActivityTaskCancelRequested }
+                            Attributes::ActivityTaskCanceledEventAttributes(_) => { EventType::ActivityTaskCanceled }
+                            Attributes::TimerCanceledEventAttributes(_) => { EventType::TimerCanceled }
+                            Attributes::MarkerRecordedEventAttributes(_) => { EventType::MarkerRecorded }
+                            Attributes::WorkflowExecutionSignaledEventAttributes(_) => { EventType::WorkflowExecutionSignaled }
+                            Attributes::WorkflowExecutionTerminatedEventAttributes(_) => { EventType::WorkflowExecutionTerminated }
+                            Attributes::WorkflowExecutionCancelRequestedEventAttributes(_) => { EventType::WorkflowExecutionCancelRequested }
+                            Attributes::WorkflowExecutionCanceledEventAttributes(_) => { EventType::WorkflowExecutionCanceled }
+                            Attributes::RequestCancelExternalWorkflowExecutionInitiatedEventAttributes(_) => { EventType::RequestCancelExternalWorkflowExecutionInitiated }
+                            Attributes::RequestCancelExternalWorkflowExecutionFailedEventAttributes(_) => { EventType::RequestCancelExternalWorkflowExecutionFailed }
+                            Attributes::ExternalWorkflowExecutionCancelRequestedEventAttributes(_) => { EventType::ExternalWorkflowExecutionCancelRequested }
+                            Attributes::WorkflowExecutionContinuedAsNewEventAttributes(_) => { EventType::WorkflowExecutionContinuedAsNew }
+                            Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(_) => { EventType::StartChildWorkflowExecutionInitiated }
+                            Attributes::StartChildWorkflowExecutionFailedEventAttributes(_) => { EventType::StartChildWorkflowExecutionFailed }
+                            Attributes::ChildWorkflowExecutionStartedEventAttributes(_) => { EventType::ChildWorkflowExecutionStarted }
+                            Attributes::ChildWorkflowExecutionCompletedEventAttributes(_) => { EventType::ChildWorkflowExecutionCompleted }
+                            Attributes::ChildWorkflowExecutionFailedEventAttributes(_) => { EventType::ChildWorkflowExecutionFailed }
+                            Attributes::ChildWorkflowExecutionCanceledEventAttributes(_) => { EventType::ChildWorkflowExecutionCanceled }
+                            Attributes::ChildWorkflowExecutionTimedOutEventAttributes(_) => { EventType::ChildWorkflowExecutionTimedOut }
+                            Attributes::ChildWorkflowExecutionTerminatedEventAttributes(_) => { EventType::ChildWorkflowExecutionTerminated }
+                            Attributes::SignalExternalWorkflowExecutionInitiatedEventAttributes(_) => { EventType::SignalExternalWorkflowExecutionInitiated }
+                            Attributes::SignalExternalWorkflowExecutionFailedEventAttributes(_) => { EventType::SignalExternalWorkflowExecutionFailed }
+                            Attributes::ExternalWorkflowExecutionSignaledEventAttributes(_) => { EventType::ExternalWorkflowExecutionSignaled }
+                            Attributes::UpsertWorkflowSearchAttributesEventAttributes(_) => { EventType::UpsertWorkflowSearchAttributes }
+                            Attributes::WorkflowExecutionUpdateAdmittedEventAttributes(_) => { EventType::WorkflowExecutionUpdateAdmitted }
+                            Attributes::WorkflowExecutionUpdateRejectedEventAttributes(_) => { EventType::WorkflowExecutionUpdateRejected }
+                            Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(_) => { EventType::WorkflowExecutionUpdateAccepted }
+                            Attributes::WorkflowExecutionUpdateCompletedEventAttributes(_) => { EventType::WorkflowExecutionUpdateCompleted }
+                            Attributes::WorkflowPropertiesModifiedExternallyEventAttributes(_) => { EventType::WorkflowPropertiesModifiedExternally }
+                            Attributes::ActivityPropertiesModifiedExternallyEventAttributes(_) => { EventType::ActivityPropertiesModifiedExternally }
+                            Attributes::WorkflowPropertiesModifiedEventAttributes(_) => { EventType::WorkflowPropertiesModified }
+                            Attributes::NexusOperationScheduledEventAttributes(_) => { EventType::NexusOperationScheduled }
+                            Attributes::NexusOperationStartedEventAttributes(_) => { EventType::NexusOperationStarted }
+                            Attributes::NexusOperationCompletedEventAttributes(_) => { EventType::NexusOperationCompleted }
+                            Attributes::NexusOperationFailedEventAttributes(_) => { EventType::NexusOperationFailed }
+                            Attributes::NexusOperationCanceledEventAttributes(_) => { EventType::NexusOperationCanceled }
+                            Attributes::NexusOperationTimedOutEventAttributes(_) => { EventType::NexusOperationTimedOut }
+                            Attributes::NexusOperationCancelRequestedEventAttributes(_) => { EventType::NexusOperationCancelRequested }
                         }
                     }
                 }
@@ -2061,6 +2146,11 @@ pub mod temporal {
         pub mod workflow {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.workflow.v1");
+            }
+        }
+        pub mod nexus {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.nexus.v1");
             }
         }
         pub mod workflowservice {

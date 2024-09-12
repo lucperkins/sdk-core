@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     abstractions::dbg_panic,
-    internal_flags::InternalFlags,
+    internal_flags::{CoreInternalFlags, InternalFlags},
     protosext::{
         protocol_messages::{IncomingProtocolMessage, IncomingProtocolMessageBody},
         CompleteLocalActivityData, HistoryEventExt, ValidScheduleLA,
@@ -37,6 +37,7 @@ use crate::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
     },
 };
+use anyhow::Context;
 use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
@@ -162,7 +163,7 @@ pub(crate) struct WorkflowMachines {
 }
 
 #[derive(Debug, derive_more::Display)]
-#[display(fmt = "Cmd&Machine({command})")]
+#[display("Cmd&Machine({command})")]
 struct CommandAndMachine {
     command: MachineAssociatedCommand,
     machine: MachineKey,
@@ -171,7 +172,7 @@ struct CommandAndMachine {
 #[derive(Debug, derive_more::Display)]
 enum MachineAssociatedCommand {
     Real(Box<ProtoCommand>),
-    #[display(fmt = "FakeLocalActivityMarker({_0})")]
+    #[display("FakeLocalActivityMarker({_0})")]
     FakeLocalActivityMarker(u32),
 }
 
@@ -185,7 +186,7 @@ struct ChangeInfo {
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum MachineResponse {
-    #[display(fmt = "PushWFJob({_0})")]
+    #[display("PushWFJob({_0})")]
     PushWFJob(OutgoingJob),
 
     /// Pushes a new command into the list that will be sent to server once we respond with the
@@ -197,31 +198,31 @@ pub(super) enum MachineResponse {
     /// The machine requests the creation of another *different* machine. This acts as if lang
     /// had replied to the activation with a command, but we use a special set of IDs to avoid
     /// collisions.
-    #[display(fmt = "NewCoreOriginatedCommand({_0:?})")]
+    #[display("NewCoreOriginatedCommand({_0:?})")]
     NewCoreOriginatedCommand(ProtoCmdAttrs),
-    #[display(fmt = "IssueFakeLocalActivityMarker({_0})")]
+    #[display("IssueFakeLocalActivityMarker({_0})")]
     IssueFakeLocalActivityMarker(u32),
-    #[display(fmt = "TriggerWFTaskStarted")]
+    #[display("TriggerWFTaskStarted")]
     TriggerWFTaskStarted {
         task_started_event_id: i64,
         time: SystemTime,
     },
-    #[display(fmt = "UpdateRunIdOnWorkflowReset({run_id})")]
+    #[display("UpdateRunIdOnWorkflowReset({run_id})")]
     UpdateRunIdOnWorkflowReset { run_id: String },
 
     /// Queue a local activity to be processed by the worker
-    #[display(fmt = "QueueLocalActivity")]
+    #[display("QueueLocalActivity")]
     QueueLocalActivity(ValidScheduleLA),
     /// Request cancellation of an executing local activity
-    #[display(fmt = "RequestCancelLocalActivity({_0})")]
+    #[display("RequestCancelLocalActivity({_0})")]
     RequestCancelLocalActivity(u32),
     /// Indicates we are abandoning the indicated LA, so we can remove it from "outstanding" LAs
     /// and we will not try to WFT heartbeat because of it.
-    #[display(fmt = "AbandonLocalActivity({_0:?})")]
+    #[display("AbandonLocalActivity({_0:?})")]
     AbandonLocalActivity(u32),
 
     /// Set the workflow time to the provided time
-    #[display(fmt = "UpdateWFTime({_0:?})")]
+    #[display("UpdateWFTime({_0:?})")]
     UpdateWFTime(Option<SystemTime>),
 }
 
@@ -238,7 +239,7 @@ impl WorkflowMachines {
     pub(crate) fn new(basics: RunBasics, driven_wf: DrivenWorkflow) -> Self {
         let replaying = basics.history.previous_wft_started_id > 0;
         let mut observed_internal_flags = InternalFlags::new(basics.capabilities);
-        // Peek ahead to determine used patches in the first WFT.
+        // Peek ahead to determine used flags in the first WFT.
         if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
             observed_internal_flags.add_from_complete(attrs);
         };
@@ -448,7 +449,7 @@ impl WorkflowMachines {
         self.drive_me
             .peek_pending_jobs()
             .iter()
-            .any(|v| v.is_la_resolution)
+            .any(|v| v.variant.is_local_activity_resolution())
     }
 
     pub(crate) fn get_metadata_for_wft_complete(&mut self) -> WorkflowTaskCompletedMetadata {
@@ -469,22 +470,30 @@ impl WorkflowMachines {
             .add_lang_used(flags);
     }
 
+    pub(crate) fn try_use_flag(&self, flag: CoreInternalFlags, should_record: bool) -> bool {
+        self.observed_internal_flags
+            .borrow_mut()
+            .try_use(flag, should_record)
+    }
+
     /// Undo a speculative workflow task by resetting to a certain WFT Started ID. This can happen
     /// when an update request is rejected.
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
-        // This is pretty nasty to just + 1 like this, but, we know WFT complete always follows
-        // WFT started, which the id given to us to reset to must be, and we need to avoid
-        // re-applying the WFT Completed event, so we make sure to consider that processed
-        self.last_processed_event = id + 1;
+        // We must reset the last event we "processed" to be after the last WFT we really completed
+        // + any command events (since the SDK "processed" those when it emitted the commands). This
+        // is also equal to what we just processed in the speculative task, minus two, since we
+        // would've just handled the most recent WFT started event, and we need to drop that & the
+        // schedule event just before it.
+        self.last_processed_event -= 2;
         // Then, we have to drop any state machines (which should only be one workflow task machine)
         // we may have created when servicing the speculative task.
         // Remove when https://github.com/rust-lang/rust/issues/59618 is stable
         let remove_these: Vec<_> = self
             .machines_by_event_id
             .iter()
-            .filter(|(mid, _)| **mid > id)
+            .filter(|(mid, _)| **mid > self.last_processed_event)
             .map(|(mid, mkey)| (*mid, *mkey))
             .collect();
         for (mid, mkey) in remove_these {
@@ -526,43 +535,6 @@ impl WorkflowMachines {
             return Ok(0);
         }
 
-        fn get_processable_messages(
-            me: &mut WorkflowMachines,
-            for_event_id: i64,
-        ) -> Vec<IncomingProtocolMessage> {
-            // Another thing to replace when `drain_filter` exists
-            let mut ret = vec![];
-            me.protocol_msgs = std::mem::take(&mut me.protocol_msgs)
-                .into_iter()
-                .filter_map(|x| {
-                    if x.processable_after_event_id()
-                        .is_some_and(|eid| eid <= for_event_id)
-                    {
-                        ret.push(x);
-                        None
-                    } else {
-                        Some(x)
-                    }
-                })
-                .collect();
-            ret
-        }
-
-        // Peek to the next WFT complete and update ourselves with data we might need in it.
-        if let Some(next_complete) = self
-            .last_history_from_server
-            .peek_next_wft_completed(self.last_processed_event)
-        {
-            // We update the internal flags before applying the current task
-            (*self.observed_internal_flags)
-                .borrow_mut()
-                .add_from_complete(next_complete);
-            // Save this tasks' Build ID if it had one
-            if let Some(bid) = next_complete.worker_version.as_ref().map(|wv| &wv.build_id) {
-                self.current_wft_build_id = Some(bid.to_string());
-            }
-        }
-
         let last_handled_wft_started_id = self.current_started_event_id;
         let (events, has_final_event) = match self
             .last_history_from_server
@@ -584,7 +556,37 @@ impl WorkflowMachines {
         };
         let num_events_to_process = events.len();
 
-        // We're caught up on reply if there are no new events to process
+        // Process any WFT completed events in the next sequence, as well as peek ahead to the
+        // subsequent one to properly apply flags & any other data. Macro used to avoid self
+        // double-borrow.
+        macro_rules! apply_wft_complete_data {
+            ($me:expr, $wtc:expr) => {{
+                (*$me.observed_internal_flags)
+                    .borrow_mut()
+                    .add_from_complete($wtc);
+                if let Some(bid) = $wtc.worker_version.as_ref().map(|wv| &wv.build_id) {
+                    $me.current_wft_build_id = Some(bid.to_string());
+                }
+            }};
+        }
+        let mut peeked_events = events.iter().peekable();
+        while let Some(event) = peeked_events.next() {
+            if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(ref wtc)) =
+                event.attributes
+            {
+                apply_wft_complete_data!(self, wtc);
+            }
+            if peeked_events.peek().is_none() {
+                if let Some(wtc) = self
+                    .last_history_from_server
+                    .peek_next_wft_completed(event.event_id)
+                {
+                    apply_wft_complete_data!(self, wtc);
+                }
+            }
+        }
+
+        // We're caught up on replay if there are no new events to process
         if events.is_empty() {
             self.replaying = false;
         }
@@ -596,6 +598,7 @@ impl WorkflowMachines {
             }
         }
 
+        let mut update_admitted_event_messages = HashMap::<String, IncomingProtocolMessage>::new();
         let mut do_handle_event = true;
         let mut history = events.into_iter().peekable();
         while let Some(event) = history.next() {
@@ -628,8 +631,42 @@ impl WorkflowMachines {
                 self.replaying = false;
             }
 
+            if matches!(
+                event.attributes,
+                Some(history_event::Attributes::WorkflowExecutionUpdateAdmittedEventAttributes(_)),
+            ) {
+                // The server has sent a durable update admitted event: create the message that would have been sent
+                // for a non-durable update request message.
+                let msg = IncomingProtocolMessage::try_from(&event).context(
+                    "Failed to create protocol message from WorkflowExecutionUpdateAdmittedEvent",
+                )?;
+                if self.replaying {
+                    // Stash the message for use if the update request is accepted.
+                    update_admitted_event_messages.insert(msg.protocol_instance_id.clone(), msg);
+                } else {
+                    // Use the message now.
+                    self.protocol_msgs.push(msg);
+                }
+                do_handle_event = false;
+            }
+
             // Process any messages that should be processed before the event we're about to handle
-            let processable_msgs = get_processable_messages(self, eid - 1);
+            let for_event_id = eid - 1;
+            // Another thing to replace when `drain_filter` exists
+            let mut processable_msgs = vec![];
+            self.protocol_msgs = std::mem::take(&mut self.protocol_msgs)
+                .into_iter()
+                .filter_map(|x| {
+                    if x.processable_after_event_id()
+                        .is_some_and(|eid| eid <= for_event_id)
+                    {
+                        processable_msgs.push(x);
+                        None
+                    } else {
+                        Some(x)
+                    }
+                })
+                .collect();
             for msg in processable_msgs {
                 self.handle_protocol_message(msg)?;
             }
@@ -664,7 +701,16 @@ impl WorkflowMachines {
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
-        // pre-resolve them.
+        // pre-resolve them. This lookahead is necessary because we need these things to be already
+        // resolved in the same activations they would have been resolved in during initial
+        // execution. For example: If a workflow asks to run an LA and then waits on it, we will
+        // write the completion marker at the end of that WFT (as a command). So, upon replay,
+        // we need to lookahead and see that that LA is in fact resolved, so that we don't decide
+        // to execute it anew when lang says it wants to run it.
+        //
+        // Alternatively, lookahead can seemingly be avoided if we were to consider the commands
+        // that follow a WFT to be _part of_ that wft rather than the next one. That change might
+        // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
         for e in self
             .last_history_from_server
             .peek_next_wft_sequence(last_handled_wft_started_id)
@@ -699,26 +745,16 @@ impl WorkflowMachines {
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
             {
-                // If we see a workflow update accepted event, initialize the machine for it by
-                // pretending we received the message we would've under not-replay.
-                delayed_actions.push(DelayedAction::ProtocolMessage(IncomingProtocolMessage {
-                    id: atts.accepted_request_message_id.clone(),
-                    protocol_instance_id: atts.protocol_instance_id.clone(),
-                    sequencing_id: Some(SequencingId::EventId(
-                        atts.accepted_request_sequencing_event_id,
-                    )),
-                    body: IncomingProtocolMessageBody::UpdateRequest(
-                        atts.accepted_request
-                            .clone()
-                            .ok_or_else(|| {
-                                WFMachinesError::Fatal(
-                                    "Update accepted event must contain accepted request"
-                                        .to_string(),
-                                )
-                            })?
-                            .try_into()?,
-                    ),
-                }));
+                // We've encountered an UpdateAccepted event during replay: pretend that we received the message we
+                // would have when receiving an update request under not-replay. If this event was preceded by an
+                // UpdateAdmitted event, then use the message that we created when we encountered that.
+                delayed_actions.push(DelayedAction::ProtocolMessage(
+                    update_admitted_event_messages
+                        .remove(&atts.protocol_instance_id)
+                        .map_or_else(|| e.try_into().context(
+                            "Failed to create protocol message from WorkflowExecutionUpdateAcceptedEvent",
+                        ), Ok)?,
+                ));
             }
         }
         for action in delayed_actions {
@@ -780,10 +816,7 @@ impl WorkflowMachines {
                 Ok(EventHandlingOutcome::Normal)
             };
         }
-        if event.event_type() == EventType::Unspecified
-            || event.event_type() == EventType::WorkflowExecutionUpdateRequested
-            || event.attributes.is_none()
-        {
+        if event.event_type() == EventType::Unspecified || event.attributes.is_none() {
             return if !event.worker_may_ignore {
                 Err(WFMachinesError::Fatal(format!(
                     "Event type is unspecified! This history is invalid. Event detail: {event:?}"
@@ -910,7 +943,7 @@ impl WorkflowMachines {
                     attrs,
                 )) = event_dat.event.attributes
                 {
-                    if let Some(st) = event_dat.event.event_time.clone() {
+                    if let Some(st) = event_dat.event.event_time {
                         let as_systime: SystemTime = st.try_into()?;
                         self.workflow_start_time = Some(as_systime);
                         // Set the workflow time to be the event time of the first event, so that
@@ -1128,6 +1161,9 @@ impl WorkflowMachines {
                         );
                     }
                     ProtoCmdAttrs::UpsertWorkflowSearchAttributesCommandAttributes(attrs) => {
+                        // We explicitly do not update the workflows current SAs here since
+                        // core-generated upserts aren't meant to be modified or used within
+                        // workflows by users (but rather, just for them to search with).
                         self.add_cmd_to_wf_task(
                             upsert_search_attrs_internal(attrs),
                             CommandIdKind::NeverResolves,
@@ -1238,6 +1274,8 @@ impl WorkflowMachines {
                     self.add_cmd_to_wf_task(new_timer(attrs), CommandID::Timer(seq).into());
                 }
                 WFCommand::UpsertSearchAttributes(attrs) => {
+                    self.drive_me
+                        .search_attributes_update(attrs.search_attributes.clone());
                     self.add_cmd_to_wf_task(
                         upsert_search_attrs(
                             attrs,
@@ -1514,16 +1552,12 @@ impl WorkflowMachines {
                     .map(Into::into)
                     .unwrap_or_default();
             }
-            if attrs.search_attributes.is_empty() {
-                attrs.search_attributes = started_info
-                    .search_attrs
-                    .clone()
-                    .map(Into::into)
-                    .unwrap_or_default();
-            }
             if attrs.retry_policy.is_none() {
-                attrs.retry_policy = started_info.retry_policy.clone();
+                attrs.retry_policy.clone_from(&started_info.retry_policy);
             }
+        }
+        if attrs.search_attributes.is_empty() {
+            attrs.search_attributes = self.drive_me.get_current_search_attributes();
         }
         attrs
     }

@@ -14,9 +14,11 @@ mod retry;
 mod worker_registry;
 mod workflow_handle;
 
-pub use crate::proxy::HttpConnectProxyOptions;
-pub use crate::retry::{CallType, RetryClient, RETRYABLE_ERROR_CODES};
-pub use raw::{HealthService, OperatorService, TestService, WorkflowService};
+pub use crate::{
+    proxy::HttpConnectProxyOptions,
+    retry::{CallType, RetryClient, RETRYABLE_ERROR_CODES},
+};
+pub use raw::{CloudService, HealthService, OperatorService, TestService, WorkflowService};
 pub use temporal_sdk_core_protos::temporal::api::{
     enums::v1::ArchivalState,
     filter::v1::{StartTimeFilter, StatusFilter, WorkflowExecutionFilter, WorkflowTypeFilter},
@@ -54,6 +56,7 @@ use temporal_sdk_core_protos::{
     coresdk::{workflow_commands::QueryResult, IntoPayloadsExt},
     grpc::health::v1::health_client::HealthClient,
     temporal::api::{
+        cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
         common::v1::{Header, Payload, Payloads, RetryPolicy, WorkflowExecution, WorkflowType},
         enums::v1::{TaskQueueKind, WorkflowIdReusePolicy},
         failure::v1::Failure,
@@ -82,6 +85,7 @@ use uuid::Uuid;
 
 static CLIENT_NAME_HEADER_KEY: &str = "client-name";
 static CLIENT_VERSION_HEADER_KEY: &str = "client-version";
+static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 /// These must match the gRPC method names, not the snake case versions that exist in the Rust code.
 static LONG_POLL_METHOD_NAMES: [&str; 3] = [
     "PollWorkflowTaskQueue",
@@ -150,6 +154,14 @@ pub struct ClientOptions {
     /// HTTP CONNECT proxy to use for this client.
     #[builder(default)]
     pub http_connect_proxy: Option<HttpConnectProxyOptions>,
+
+    /// If set true, error code labels will not be included on request failure metrics.
+    #[builder(default)]
+    pub disable_error_code_metric_tags: bool,
+
+    /// If set true, get_system_info will not be called upon connection
+    #[builder(default)]
+    pub skip_get_system_info: bool,
 }
 
 /// Configuration options for TLS
@@ -194,7 +206,7 @@ impl Default for ClientKeepAliveConfig {
 }
 
 /// Configuration for retrying requests to the server
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RetryConfig {
     /// initial wait time before the first retry.
     pub initial_interval: Duration,
@@ -421,6 +433,7 @@ impl ClientOptions {
             .layer_fn(move |channel| GrpcMetricSvc {
                 inner: channel,
                 metrics: metrics_meter.clone().map(MetricsContext::new),
+                disable_errcode_label: self.disable_error_code_metric_tags,
             })
             .service(channel);
         let headers = Arc::new(RwLock::new(ClientHeaders {
@@ -440,18 +453,20 @@ impl ClientOptions {
             capabilities: None,
             workers: Arc::new(SlotManager::new()),
         };
-        match client
-            .get_system_info(GetSystemInfoRequest::default())
-            .await
-        {
-            Ok(sysinfo) => {
-                client.capabilities = sysinfo.into_inner().capabilities;
-            }
-            Err(status) => match status.code() {
-                Code::Unimplemented => {}
-                _ => return Err(ClientInitError::SystemInfoCallError(status)),
-            },
-        };
+        if !self.skip_get_system_info {
+            match client
+                .get_system_info(GetSystemInfoRequest::default())
+                .await
+            {
+                Ok(sysinfo) => {
+                    client.capabilities = sysinfo.into_inner().capabilities;
+                }
+                Err(status) => match status.code() {
+                    Code::Unimplemented => {}
+                    _ => return Err(ClientInitError::SystemInfoCallError(status)),
+                },
+            };
+        }
         Ok(RetryClient::new(client, self.retry_config.clone()))
     }
 
@@ -459,7 +474,7 @@ impl ClientOptions {
     /// Passes it through if TLS options not set.
     async fn add_tls_to_channel(&self, mut channel: Endpoint) -> Result<Endpoint, ClientInitError> {
         if let Some(tls_cfg) = &self.tls_cfg {
-            let mut tls = tonic::transport::ClientTlsConfig::new();
+            let mut tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
 
             if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
                 let server_root_ca_cert = Certificate::from_pem(root_cert);
@@ -521,9 +536,7 @@ impl Interceptor for ServiceCallInterceptor {
             );
         }
         self.headers.read().apply_to_metadata(metadata);
-        if !metadata.contains_key("grpc-timeout") {
-            request.set_timeout(OTHER_CALL_TIMEOUT);
-        }
+        request.set_default_timeout(OTHER_CALL_TIMEOUT);
 
         Ok(request)
     }
@@ -535,6 +548,7 @@ pub struct TemporalServiceClient<T> {
     svc: T,
     workflow_svc_client: OnceCell<WorkflowServiceClient<T>>,
     operator_svc_client: OnceCell<OperatorServiceClient<T>>,
+    cloud_svc_client: OnceCell<CloudServiceClient<T>>,
     test_svc_client: OnceCell<TestServiceClient<T>>,
     health_svc_client: OnceCell<HealthClient<T>>,
 }
@@ -564,6 +578,7 @@ where
             svc,
             workflow_svc_client: OnceCell::new(),
             operator_svc_client: OnceCell::new(),
+            cloud_svc_client: OnceCell::new(),
             test_svc_client: OnceCell::new(),
             health_svc_client: OnceCell::new(),
         }
@@ -579,6 +594,13 @@ where
     pub fn operator_svc(&self) -> &OperatorServiceClient<T> {
         self.operator_svc_client.get_or_init(|| {
             OperatorServiceClient::new(self.svc.clone())
+                .max_decoding_message_size(get_decode_max_size())
+        })
+    }
+    /// Get the underlying cloud service client
+    pub fn cloud_svc(&self) -> &CloudServiceClient<T> {
+        self.cloud_svc_client.get_or_init(|| {
+            CloudServiceClient::new(self.svc.clone())
                 .max_decoding_message_size(get_decode_max_size())
         })
     }
@@ -604,6 +626,11 @@ where
     pub fn operator_svc_mut(&mut self) -> &mut OperatorServiceClient<T> {
         let _ = self.operator_svc();
         self.operator_svc_client.get_mut().unwrap()
+    }
+    /// Get the underlying cloud service client mutably
+    pub fn cloud_svc_mut(&mut self) -> &mut CloudServiceClient<T> {
+        let _ = self.cloud_svc();
+        self.cloud_svc_client.get_mut().unwrap()
     }
     /// Get the underlying test service client mutably
     pub fn test_svc_mut(&mut self) -> &mut TestServiceClient<T> {
@@ -1597,9 +1624,22 @@ pub trait WfClientExt: WfHandleClient + Sized + Clone {
 
 impl<T> WfClientExt for T where T: WfHandleClient + Clone + Sized {}
 
+trait RequestExt {
+    /// Set a timeout for a request if one is not already specified in the metadata
+    fn set_default_timeout(&mut self, duration: Duration);
+}
+impl<T> RequestExt for tonic::Request<T> {
+    fn set_default_timeout(&mut self, duration: Duration) {
+        if !self.metadata().contains_key("grpc-timeout") {
+            self.set_timeout(duration)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonic::metadata::Ascii;
 
     #[test]
     fn applies_headers() {
@@ -1660,6 +1700,16 @@ mod tests {
         let req = interceptor.call(tonic::Request::new(())).unwrap();
         assert!(!req.metadata().contains_key("my-meta-key"));
         assert!(!req.metadata().contains_key("authorization"));
+
+        // Timeout header not overriden
+        let mut req = tonic::Request::new(());
+        req.metadata_mut()
+            .insert("grpc-timeout", "1S".parse().unwrap());
+        let req = interceptor.call(req).unwrap();
+        assert_eq!(
+            req.metadata().get("grpc-timeout").unwrap(),
+            "1S".parse::<MetadataValue<Ascii>>().unwrap()
+        );
     }
 
     #[test]

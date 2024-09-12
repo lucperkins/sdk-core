@@ -8,7 +8,7 @@ use crate::{
     worker::{
         workflow::{
             machines::{activity_state_machine::activity_fail_info, HistEventData},
-            InternalFlagsRef, OutgoingJob,
+            InternalFlagsRef,
         },
         LocalActivityExecutionResult,
     },
@@ -34,7 +34,6 @@ use temporal_sdk_core_protos::{
         command::v1::{command, RecordMarkerCommandAttributes},
         enums::v1::{CommandType, EventType, RetryState},
         failure::v1::{failure::FailureInfo, Failure},
-        history::v1::HistoryEvent,
     },
     utilities::TryIntoOrNone,
 };
@@ -343,17 +342,17 @@ impl SharedState {
 #[derive(Debug, derive_more::Display)]
 pub(super) enum LocalActivityCommand {
     RequestActivityExecution(ValidScheduleLA),
-    #[display(fmt = "Resolved")]
+    #[display("Resolved")]
     Resolved(ResolveDat),
     /// The fake marker is used to avoid special casing marker recorded event handling.
     /// If we didn't have the fake marker, there would be no "outgoing command" to match
     /// against the event. This way there is, but the command never will be issued to
     /// server because it is understood to be meaningless.
-    #[display(fmt = "FakeMarker")]
+    #[display("FakeMarker")]
     FakeMarker,
     /// Indicate we want to cancel an LA that is currently executing, or look up if we have
     /// processed a marker with resolution data since the machine was constructed.
-    #[display(fmt = "Cancel")]
+    #[display("Cancel")]
     RequestCancel,
 }
 
@@ -632,9 +631,6 @@ impl Cancellable for LocalActivityMachine {
     }
 }
 
-#[derive(Default, Clone)]
-pub(super) struct Abandoned {}
-
 impl WFMachinesAdapter for LocalActivityMachine {
     fn adapt_response(
         &self,
@@ -675,7 +671,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                         status: Some(
                             DoBackoff {
                                 attempt: attempt + 1,
-                                backoff_duration: Some(b.clone()),
+                                backoff_duration: Some(*b),
                                 original_schedule_time: original_schedule_time.map(Into::into),
                             }
                             .into(),
@@ -738,14 +734,12 @@ impl WFMachinesAdapter for LocalActivityMachine {
                 };
 
                 let mut responses = vec![
-                    MachineResponse::PushWFJob(OutgoingJob {
-                        variant: ResolveActivity {
-                            seq: self.shared_state.attrs.seq,
-                            result: Some(resolution),
-                        }
-                        .into(),
-                        is_la_resolution: true,
-                    }),
+                    ResolveActivity {
+                        seq: self.shared_state.attrs.seq,
+                        result: Some(resolution),
+                        is_local: true,
+                    }
+                    .into(),
                     MachineResponse::UpdateWFTime(complete_time),
                 ];
 
@@ -798,10 +792,6 @@ impl WFMachinesAdapter for LocalActivityMachine {
                 )])
             }
         }
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        event.is_local_activity_marker()
     }
 }
 
@@ -887,7 +877,7 @@ mod tests {
         time::Duration,
     };
     use temporal_sdk::{
-        ActContext, ActivityCancelledError, CancellableFuture, LocalActivityOptions, WfContext,
+        ActContext, ActivityError, CancellableFuture, LocalActivityOptions, WfContext,
         WorkflowResult,
     };
     use temporal_sdk_core_protos::{
@@ -993,7 +983,7 @@ mod tests {
                 if completes_ok {
                     Ok("hi")
                 } else {
-                    Err(anyhow!("Oh no I failed!"))
+                    Err(anyhow!("Oh no I failed!").into())
                 }
             },
         );
@@ -1455,7 +1445,7 @@ mod tests {
                     ctx.cancelled().await;
                 }
                 allow_cancel_barr_clone.cancelled().await;
-                Result::<(), _>::Err(anyhow!(ActivityCancelledError::default()))
+                Result::<(), _>::Err(ActivityError::cancelled())
             }
         });
         worker.run().await.unwrap();

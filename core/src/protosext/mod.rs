@@ -109,6 +109,9 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 messages,
                 ..
             } => {
+                if task_token.is_empty() {
+                    return Err(anyhow!("missing task token"));
+                }
                 let query_requests = queries
                     .into_iter()
                     .map(|(id, q)| query_to_job(id, q))
@@ -403,7 +406,6 @@ impl ValidScheduleLA {
         let retry_policy = v.retry_policy.unwrap_or_default();
         let local_retry_threshold = v
             .local_retry_threshold
-            .clone()
             .try_into_or_none()
             .unwrap_or_else(|| Duration::from_secs(60));
         let cancellation_type = ActivityCancellationType::try_from(v.cancellation_type)

@@ -38,7 +38,7 @@ use temporal_sdk_core_protos::{
         history::v1::{
             history_event, ChildWorkflowExecutionCompletedEventAttributes,
             ChildWorkflowExecutionFailedEventAttributes,
-            ChildWorkflowExecutionStartedEventAttributes, HistoryEvent,
+            ChildWorkflowExecutionStartedEventAttributes,
             StartChildWorkflowExecutionFailedEventAttributes,
         },
     },
@@ -105,19 +105,19 @@ pub(super) struct ChildWorkflowExecutionStartedEvent {
 
 #[derive(Debug, derive_more::Display)]
 pub(super) enum ChildWorkflowCommand {
-    #[display(fmt = "Start")]
+    #[display("Start")]
     Start(WorkflowExecution),
-    #[display(fmt = "Complete")]
+    #[display("Complete")]
     Complete(Option<Payloads>),
-    #[display(fmt = "Fail")]
+    #[display("Fail")]
     Fail(Failure),
-    #[display(fmt = "Cancel")]
+    #[display("Cancel")]
     Cancel,
-    #[display(fmt = "StartFail")]
+    #[display("StartFail")]
     StartFail(StartChildWorkflowExecutionFailedCause),
-    #[display(fmt = "StartCancel")]
+    #[display("StartCancel")]
     StartCancel(Failure),
-    #[display(fmt = "CancelAfterStarted")]
+    #[display("CancelAfterStarted")]
     IssueCancelAfterStarted { reason: String },
 }
 
@@ -283,7 +283,7 @@ impl StartEventRecorded {
         event: ChildWorkflowExecutionStartedEvent,
     ) -> ChildWorkflowMachineTransition<Started> {
         state.started_event_id = event.started_event_id;
-        state.run_id = event.workflow_execution.run_id.clone();
+        state.run_id.clone_from(&event.workflow_execution.run_id);
         ChildWorkflowMachineTransition::commands(vec![ChildWorkflowCommand::Start(
             event.workflow_execution,
         )])
@@ -457,6 +457,7 @@ impl ChildWorkflowMachine {
                 attribs,
                 use_compatible_version,
             )),
+            user_metadata: Default::default(),
         };
         NewMachineWithCommand {
             command: cmd,
@@ -703,20 +704,6 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                 resps
             }
         })
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::StartChildWorkflowExecutionInitiated
-                | EventType::StartChildWorkflowExecutionFailed
-                | EventType::ChildWorkflowExecutionStarted
-                | EventType::ChildWorkflowExecutionCompleted
-                | EventType::ChildWorkflowExecutionFailed
-                | EventType::ChildWorkflowExecutionTimedOut
-                | EventType::ChildWorkflowExecutionTerminated
-                | EventType::ChildWorkflowExecutionCanceled
-        )
     }
 }
 

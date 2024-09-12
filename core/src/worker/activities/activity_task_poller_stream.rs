@@ -35,6 +35,10 @@ pub(crate) fn new_activity_task_poller(
                                 state.metrics.act_poll_timeout();
                                 continue;
                             }
+                            if let Some(reason) = validate_activity_task(&resp) {
+                                warn!("Received invalid activity task ({}): {:?}", reason, &resp);
+                                continue;
+                            }
                             Some(Ok(PermittedTqResp { permit, resp }))
                         }
                         Some(Err(e)) => {
@@ -64,4 +68,11 @@ pub(crate) fn new_activity_task_poller(
             }
         }
     })
+}
+
+fn validate_activity_task(task: &PollActivityTaskQueueResponse) -> Option<&'static str> {
+    if task.task_token.is_empty() {
+        return Some("missing task token");
+    }
+    None
 }

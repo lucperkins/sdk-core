@@ -9,7 +9,6 @@ use temporal_sdk_core_protos::{
     temporal::api::{
         command::v1::Command,
         enums::v1::{CommandType, EventType},
-        history::v1::HistoryEvent,
     },
 };
 
@@ -32,6 +31,7 @@ pub(super) fn modify_workflow_properties(
     let cmd = Command {
         command_type: CommandType::ModifyWorkflowProperties as i32,
         attributes: Some(lang_cmd.into()),
+        user_metadata: Default::default(),
     };
     NewMachineWithCommand {
         command: cmd,
@@ -62,10 +62,6 @@ impl WFMachinesAdapter for ModifyWorkflowPropertiesMachine {
         Err(Self::Error::Nondeterminism(
             "ModifyWorkflowProperties does not use state machine commands".to_string(),
         ))
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(event.event_type(), EventType::WorkflowPropertiesModified)
     }
 }
 

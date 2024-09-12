@@ -11,7 +11,7 @@ use std::{
 };
 use temporal_sdk_core_protos::temporal::api::{
     enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
-    history::v1::{history_event::Attributes::WorkflowTaskFailedEventAttributes, HistoryEvent},
+    history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
 };
 
 fsm! {
@@ -44,12 +44,12 @@ impl WorkflowTaskMachine {
 #[derive(Debug, derive_more::Display)]
 pub(super) enum WFTaskMachineCommand {
     /// Issued to (possibly) trigger the event loop
-    #[display(fmt = "WFTaskStartedTrigger")]
+    #[display("WFTaskStartedTrigger")]
     WFTaskStartedTrigger {
         task_started_event_id: i64,
         time: SystemTime,
     },
-    #[display(fmt = "RunIdOnWorkflowResetUpdate({run_id})")]
+    #[display("RunIdOnWorkflowResetUpdate({run_id})")]
     RunIdOnWorkflowResetUpdate { run_id: String },
 }
 
@@ -88,17 +88,6 @@ impl WFMachinesAdapter for WorkflowTaskMachine {
             }
         }
     }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::WorkflowTaskScheduled
-                | EventType::WorkflowTaskStarted
-                | EventType::WorkflowTaskTimedOut
-                | EventType::WorkflowTaskCompleted
-                | EventType::WorkflowTaskFailed
-        )
-    }
 }
 
 impl TryFrom<HistEventData> for WorkflowTaskMachineEvents {
@@ -109,7 +98,7 @@ impl TryFrom<HistEventData> for WorkflowTaskMachineEvents {
         Ok(match e.event_type() {
             EventType::WorkflowTaskScheduled => Self::WorkflowTaskScheduled,
             EventType::WorkflowTaskStarted => Self::WorkflowTaskStarted({
-                let time = if let Some(time) = e.event_time.clone() {
+                let time = if let Some(time) = e.event_time {
                     match time.try_into() {
                         Ok(t) => t,
                         Err(_) => {

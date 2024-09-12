@@ -1,12 +1,18 @@
 use crate::{abstractions::dbg_panic, telemetry::TelemetryInstance};
 
-use std::{fmt::Debug, iter::Iterator, sync::Arc, time::Duration};
+use std::{
+    fmt::{Debug, Display},
+    iter::Iterator,
+    sync::Arc,
+    time::Duration,
+};
 use temporal_sdk_core_api::telemetry::metrics::{
     BufferAttributes, BufferInstrumentRef, CoreMeter, Counter, Gauge, GaugeF64, Histogram,
     HistogramDuration, HistogramF64, LazyBufferInstrument, MetricAttributes, MetricCallBufferer,
     MetricEvent, MetricKeyValue, MetricKind, MetricParameters, MetricUpdateVal, NewAttributes,
     NoOpCoreMeter,
 };
+use temporal_sdk_core_protos::temporal::api::enums::v1::WorkflowTaskFailedCause;
 
 /// Used to track context associated with metrics, and record/update them
 ///
@@ -39,6 +45,7 @@ struct Instruments {
     worker_registered: Arc<dyn Counter>,
     num_pollers: Arc<dyn Gauge>,
     task_slots_available: Arc<dyn Gauge>,
+    task_slots_used: Arc<dyn Gauge>,
     sticky_cache_hit: Arc<dyn Counter>,
     sticky_cache_miss: Arc<dyn Counter>,
     sticky_cache_size: Arc<dyn Gauge>,
@@ -195,6 +202,11 @@ impl MetricsContext {
             .record(num as u64, &self.kvs)
     }
 
+    /// Record current number of used task slots. Context should have worker type set.
+    pub(crate) fn task_slots_used(&self, num: u64) {
+        self.instruments.task_slots_used.record(num, &self.kvs)
+    }
+
     /// Record current number of pollers. Context should include poller type / task queue tag.
     pub(crate) fn record_num_pollers(&self, num: usize) {
         self.instruments.num_pollers.record(num as u64, &self.kvs);
@@ -320,6 +332,11 @@ impl Instruments {
                 description: "Current number of available slots per task type".into(),
                 unit: "".into(),
             }),
+            task_slots_used: meter.gauge(MetricParameters {
+                name: TASK_SLOTS_USED_NAME.into(),
+                description: "Current number of used slots per task type".into(),
+                unit: "".into(),
+            }),
             sticky_cache_hit: meter.counter(MetricParameters {
                 name: "sticky_cache_hit".into(),
                 description: "Count of times the workflow cache was used for a new workflow task"
@@ -354,6 +371,7 @@ const KEY_ACT_TYPE: &str = "activity_type";
 const KEY_POLLER_TYPE: &str = "poller_type";
 const KEY_WORKER_TYPE: &str = "worker_type";
 const KEY_EAGER: &str = "eager";
+const KEY_TASK_FAILURE_TYPE: &str = "failure_reason";
 
 pub(crate) fn workflow_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "workflow_task")
@@ -385,6 +403,30 @@ pub(crate) fn local_activity_worker_type() -> MetricKeyValue {
 pub(crate) fn eager(is_eager: bool) -> MetricKeyValue {
     MetricKeyValue::new(KEY_EAGER, is_eager)
 }
+pub(crate) enum FailureReason {
+    Nondeterminism,
+    Workflow,
+}
+impl Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            FailureReason::Nondeterminism => "NonDeterminismError",
+            FailureReason::Workflow => "WorkflowError",
+        };
+        write!(f, "{}", str)
+    }
+}
+impl From<WorkflowTaskFailedCause> for FailureReason {
+    fn from(v: WorkflowTaskFailedCause) -> Self {
+        match v {
+            WorkflowTaskFailedCause::NonDeterministicError => FailureReason::Nondeterminism,
+            _ => FailureReason::Workflow,
+        }
+    }
+}
+pub(crate) fn failure_reason(reason: FailureReason) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_TASK_FAILURE_TYPE, reason.to_string())
+}
 
 pub(super) const WF_E2E_LATENCY_NAME: &str = "workflow_endtoend_latency";
 pub(super) const WF_TASK_SCHED_TO_START_LATENCY_NAME: &str =
@@ -395,6 +437,7 @@ pub(super) const ACT_SCHED_TO_START_LATENCY_NAME: &str = "activity_schedule_to_s
 pub(super) const ACT_EXEC_LATENCY_NAME: &str = "activity_execution_latency";
 pub(super) const NUM_POLLERS_NAME: &str = "num_pollers";
 pub(super) const TASK_SLOTS_AVAILABLE_NAME: &str = "worker_task_slots_available";
+pub(super) const TASK_SLOTS_USED_NAME: &str = "worker_task_slots_used";
 pub(super) const STICKY_CACHE_SIZE_NAME: &str = "sticky_cache_size";
 
 /// Helps define buckets once in terms of millis, but also generates a seconds version
@@ -764,7 +807,7 @@ mod tests {
         a1.set(Arc::new(DummyCustomAttrs(1))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 23;
+        let num_metrics = 24;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 1..=num_metrics {
             let hole = assert_matches!(&events[metric_num],

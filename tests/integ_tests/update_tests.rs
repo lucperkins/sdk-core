@@ -1,12 +1,15 @@
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::{future, future::join_all, StreamExt};
 use once_cell::sync::Lazy;
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
-use temporal_client::WorkflowClientTrait;
+use temporal_client::{Client, RetryClient, WorkflowClientTrait, WorkflowService};
 use temporal_sdk::{ActContext, ActivityOptions, LocalActivityOptions, UpdateContext, WfContext};
 use temporal_sdk_core::replay::HistoryForReplay;
 use temporal_sdk_core_api::Worker;
@@ -23,29 +26,167 @@ use temporal_sdk_core_protos::{
         ActivityTaskCompletion, AsJsonPayloadExt, IntoPayloadsExt,
     },
     temporal::api::{
-        enums::v1::{EventType, UpdateWorkflowExecutionLifecycleStage},
-        update,
-        update::v1::WaitPolicy,
+        common::v1::WorkflowExecution,
+        enums::v1::{EventType, ResetReapplyType, UpdateWorkflowExecutionLifecycleStage},
+        update::{self, v1::WaitPolicy},
+        workflowservice::v1::ResetWorkflowExecutionRequest,
     },
 };
 use temporal_sdk_core_test_utils::{
-    init_core_and_create_wf, init_core_replay_preloaded, start_timer_cmd, CoreWfStarter,
-    WorkerTestHelpers,
+    drain_pollers_and_shutdown, init_core_and_create_wf, init_core_replay_preloaded,
+    start_timer_cmd, CoreWfStarter, WorkerTestHelpers,
 };
 use tokio::{join, sync::Barrier};
+use uuid::Uuid;
+
+#[derive(Clone, Copy)]
+enum FailUpdate {
+    Yes,
+    No,
+}
+
+#[derive(Clone, Copy)]
+enum CompleteWorkflow {
+    Yes,
+    No,
+}
 
 #[rstest::rstest]
 #[tokio::test]
-async fn update_workflow(#[values(true, false)] will_fail: bool) {
+async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: FailUpdate) {
     let mut starter = init_core_and_create_wf("update_workflow").await;
     let core = starter.get_worker().await;
     let client = starter.get_client().await;
-    let workflow_id = starter.get_task_queue().to_string();
-
+    let workflow_id = starter.get_task_queue();
     let update_id = "some_update";
-    // Task is completed with no commands
-    let res = core.poll_workflow_activation().await.unwrap();
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(res.run_id.clone()))
+    send_and_handle_update(
+        workflow_id,
+        update_id,
+        will_fail,
+        CompleteWorkflow::Yes,
+        core.as_ref(),
+        client.as_ref(),
+    )
+    .await;
+
+    // Make sure replay works
+    let history = client
+        .get_workflow_execution_history(workflow_id.to_string(), None, vec![])
+        .await
+        .unwrap()
+        .history
+        .unwrap();
+    let with_id = HistoryForReplay::new(history, workflow_id.to_string());
+    let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
+    handle_update(will_fail, CompleteWorkflow::Yes, replay_worker.as_ref(), 1).await;
+}
+
+#[tokio::test]
+async fn reapplied_updates_due_to_reset() {
+    let mut starter = init_core_and_create_wf("update_workflow").await;
+    let core = starter.get_worker().await;
+    let client = starter.get_client().await;
+    let workflow_id = starter.get_task_queue();
+    let pre_reset_run_id = send_and_handle_update(
+        workflow_id,
+        "first-update",
+        FailUpdate::No,
+        CompleteWorkflow::Yes,
+        core.as_ref(),
+        client.as_ref(),
+    )
+    .await;
+
+    // Reset to before the update was accepted
+    let workflow_task_finish_event_id = 4;
+
+    let mut client_mut = client.clone();
+    let reset_response = WorkflowService::reset_workflow_execution(
+        Arc::make_mut(&mut client_mut),
+        ResetWorkflowExecutionRequest {
+            namespace: client.namespace().into(),
+            workflow_execution: Some(WorkflowExecution {
+                workflow_id: workflow_id.into(),
+                run_id: pre_reset_run_id.clone(),
+            }),
+            workflow_task_finish_event_id,
+            reset_reapply_type: ResetReapplyType::AllEligible as i32,
+            request_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    // Accept and complete the reapplied update
+    // Index here is 2 because there will be start workflow & update random seed (from the reset)
+    // first.
+    handle_update(FailUpdate::No, CompleteWorkflow::No, core.as_ref(), 2).await;
+
+    // Send a second update and complete the workflow
+    let post_reset_run_id = send_and_handle_update(
+        workflow_id,
+        "second-update",
+        FailUpdate::No,
+        CompleteWorkflow::Yes,
+        core.as_ref(),
+        client.as_ref(),
+    )
+    .await;
+
+    assert_eq!(post_reset_run_id, reset_response.run_id);
+
+    // Make sure replay works
+    let history = client
+        .get_workflow_execution_history(workflow_id.to_string(), Some(post_reset_run_id), vec![])
+        .await
+        .unwrap()
+        .history
+        .unwrap();
+    let with_id = HistoryForReplay::new(history, workflow_id.to_string());
+
+    let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
+    // We now recapitulate the actions that the worker took on first execution above, pretending
+    // that we always followed the post-reset history.
+    // First, we handled the post-reset reapplied update and did not complete the workflow.
+    handle_update(
+        FailUpdate::No,
+        CompleteWorkflow::No,
+        replay_worker.as_ref(),
+        2,
+    )
+    .await;
+    // Then the client sent a second update; we handled it and completed the workflow.
+    handle_update(
+        FailUpdate::No,
+        CompleteWorkflow::Yes,
+        replay_worker.as_ref(),
+        0,
+    )
+    .await;
+
+    // This is a replay worker and there is a remaining activation containing a RemoveFromCache job.
+    let act = replay_worker.poll_workflow_activation().await.unwrap();
+    replay_worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    drain_pollers_and_shutdown(&replay_worker).await;
+}
+
+// Start a workflow, send an update, accept the update, complete the update, complete the workflow.
+async fn send_and_handle_update(
+    workflow_id: &str,
+    update_id: &str,
+    fail_update: FailUpdate,
+    complete_workflow: CompleteWorkflow,
+    core: &dyn Worker,
+    client: &RetryClient<Client>,
+) -> String {
+    // Complete first task with no commands
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id.clone()))
         .await
         .unwrap();
 
@@ -54,7 +195,7 @@ async fn update_workflow(#[values(true, false)] will_fail: bool) {
         client
             .update_workflow_execution(
                 workflow_id.to_string(),
-                res.run_id.to_string(),
+                act.run_id.to_string(),
                 update_id.to_string(),
                 WaitPolicy {
                     lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Completed as i32,
@@ -65,40 +206,37 @@ async fn update_workflow(#[values(true, false)] will_fail: bool) {
             .unwrap()
     };
 
-    let processing_task = _do_update_workflow(will_fail, core.as_ref());
+    // Accept update, complete update and complete workflow
+    let processing_task = handle_update(fail_update, complete_workflow, core, 0);
     let (ur, _) = join!(update_task, processing_task);
 
     let v = ur.outcome.unwrap().value.unwrap();
-    if will_fail {
-        assert_matches!(v, update::v1::outcome::Value::Failure(_));
-    } else {
-        assert_matches!(v, update::v1::outcome::Value::Success(_));
+    match fail_update {
+        FailUpdate::Yes => assert_matches!(v, update::v1::outcome::Value::Failure(_)),
+        FailUpdate::No => assert_matches!(v, update::v1::outcome::Value::Success(_)),
     }
-
-    // Make sure replay works
-    let history = client
-        .get_workflow_execution_history(workflow_id.clone(), None, vec![])
-        .await
-        .unwrap()
-        .history
-        .unwrap();
-    let with_id = HistoryForReplay::new(history, workflow_id.clone());
-    let replay_worker = init_core_replay_preloaded(&workflow_id, [with_id]);
-    _do_update_workflow(will_fail, replay_worker.as_ref()).await;
+    act.run_id
 }
 
-async fn _do_update_workflow(will_fail: bool, core: &dyn Worker) {
-    let res = core.poll_workflow_activation().await.unwrap();
-    // On replay, the first activation has update & start workflow, but on first execution, it does
-    // not - can happen if update is waiting on some condition.
+// Accept and then complete update. If `FailUpdate::Yes` then complete the update as a failure; if
+// `CompleteWorkflow::Yes` then additionally complete the workflow. Timers are created when further
+// activations are required (i.e., on accepting-but-not-completing the update, and on completing the
+// update if not also completing the workflow).
+async fn handle_update(
+    fail_update: FailUpdate,
+    complete_workflow: CompleteWorkflow,
+    core: &dyn Worker,
+    update_job_index: usize,
+) {
+    let act = core.poll_workflow_activation().await.unwrap();
     let pid = assert_matches!(
-        &res.jobs[0],
+        &act.jobs[update_job_index],
         WorkflowActivationJob {
             variant: Some(workflow_activation_job::Variant::DoUpdate(d)),
         } => &d.protocol_instance_id
     );
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-        res.run_id,
+        act.run_id,
         vec![
             UpdateResponse {
                 protocol_instance_id: pid.to_string(),
@@ -111,26 +249,28 @@ async fn _do_update_workflow(will_fail: bool, core: &dyn Worker) {
     .await
     .unwrap();
 
-    let response = if will_fail {
-        UpdateResponse {
+    // Timer fires
+    let act = core.poll_workflow_activation().await.unwrap();
+    let update_response = match fail_update {
+        FailUpdate::Yes => UpdateResponse {
             protocol_instance_id: pid.to_string(),
             response: Some(update_response::Response::Rejected(
                 "uh oh spaghettios!".into(),
             )),
-        }
-    } else {
-        UpdateResponse {
+        },
+        FailUpdate::No => UpdateResponse {
             protocol_instance_id: pid.to_string(),
             response: Some(update_response::Response::Completed("done!".into())),
-        }
+        },
     };
-    let res = core.poll_workflow_activation().await.unwrap();
-    // Timer fires
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-        res.run_id,
+        act.run_id,
         vec![
-            response.into(),
-            CompleteWorkflowExecution { result: None }.into(),
+            update_response.into(),
+            match complete_workflow {
+                CompleteWorkflow::Yes => CompleteWorkflowExecution { result: None }.into(),
+                CompleteWorkflow::No => start_timer_cmd(1, Duration::from_millis(1)),
+            },
         ],
     ))
     .await
@@ -440,7 +580,7 @@ async fn update_speculative_wft() {
         assert_matches!(
             res.jobs.as_slice(),
             [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::StartWorkflow(_)),
+                variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
             }]
         );
         core.complete_workflow_activation(WorkflowActivationCompletion::empty(res.run_id))
@@ -664,7 +804,7 @@ async fn update_timer_sequence() {
                 Ok("done")
             },
         );
-        ctx.timer(Duration::from_secs(1)).await;
+        ctx.timer(Duration::from_secs(2)).await;
         Ok(().into())
     });
 
@@ -843,7 +983,7 @@ async fn worker_restarted_in_middle_of_update() {
         BARR.wait().await;
         if !ACT_RAN.fetch_or(true, Ordering::Relaxed) {
             // On first run fail the task so we'll get retried on the new worker
-            bail!("Fail first time");
+            return Err(anyhow!("Fail first time").into());
         }
         Ok(echo_me)
     });

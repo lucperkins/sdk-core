@@ -1,6 +1,6 @@
 use super::{
-    workflow_machines::MachineResponse, Cancellable, EventInfo, HistoryEvent,
-    NewMachineWithCommand, OnEventWrapper, WFMachinesAdapter, WFMachinesError,
+    workflow_machines::MachineResponse, Cancellable, EventInfo, NewMachineWithCommand,
+    OnEventWrapper, WFMachinesAdapter, WFMachinesError,
 };
 use crate::worker::workflow::machines::HistEventData;
 use rustfsm::{fsm, StateMachine, TransitionResult};
@@ -27,9 +27,6 @@ fsm! {
         --> CancelWorkflowCommandRecorded;
 }
 
-#[derive(thiserror::Error, Debug)]
-pub(super) enum CancelWorkflowMachineError {}
-
 #[derive(Debug, derive_more::Display)]
 pub(super) enum CancelWorkflowCommand {}
 
@@ -40,6 +37,7 @@ pub(super) fn cancel_workflow(attribs: CancelWorkflowExecution) -> NewMachineWit
     let command = Command {
         command_type: CommandType::CancelWorkflowExecution as i32,
         attributes: Some(attribs.into()),
+        user_metadata: Default::default(),
     };
     NewMachineWithCommand {
         command,
@@ -105,10 +103,6 @@ impl WFMachinesAdapter for CancelWorkflowMachine {
     ) -> Result<Vec<MachineResponse>, WFMachinesError> {
         Ok(vec![])
     }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        event.event_type() == EventType::WorkflowExecutionCanceled
-    }
 }
 
 impl Cancellable for CancelWorkflowMachine {}
@@ -139,7 +133,7 @@ mod tests {
             assert_matches!(
                 a.jobs.as_slice(),
                 [WorkflowActivationJob {
-                    variant: Some(workflow_activation_job::Variant::StartWorkflow(_)),
+                    variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
                 }]
             )
         });

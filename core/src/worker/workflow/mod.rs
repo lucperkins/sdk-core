@@ -16,7 +16,7 @@ pub(crate) use history_update::HistoryUpdate;
 
 use crate::{
     abstractions::{
-        dbg_panic, take_cell::TakeCell, MeteredSemaphore, TrackedOwnedMeteredSemPermit,
+        dbg_panic, take_cell::TakeCell, MeteredPermitDealer, TrackedOwnedMeteredSemPermit,
         UsedMeteredSemPermit,
     },
     internal_flags::InternalFlags,
@@ -40,15 +40,14 @@ use crate::{
 use anyhow::anyhow;
 use futures::{stream::BoxStream, Stream, StreamExt};
 use futures_util::{future::abortable, stream};
+use itertools::Itertools;
 use prost_types::TimestampError;
 use std::{
     cell::RefCell,
-    cmp::Ordering,
     collections::VecDeque,
     fmt::Debug,
     future::Future,
     mem,
-    mem::discriminant,
     ops::DerefMut,
     rc::Rc,
     result,
@@ -58,7 +57,7 @@ use std::{
 };
 use temporal_sdk_core_api::{
     errors::{CompleteWfError, PollWfError},
-    worker::WorkerConfig,
+    worker::{ActivitySlotKind, WorkerConfig, WorkflowSlotKind},
 };
 use temporal_sdk_core_protos::{
     coresdk::{
@@ -122,7 +121,7 @@ pub(crate) struct Workflows {
     /// If set, can be used to reserve activity task slots for eager-return of new activity tasks.
     activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
     /// Ensures we stay at or below this worker's maximum concurrent workflow task limit
-    wft_semaphore: Arc<MeteredSemaphore>,
+    wft_semaphore: Arc<MeteredPermitDealer<WorkflowSlotKind>>,
     local_act_mgr: Arc<LocalActivityManager>,
     ever_polled: AtomicBool,
 }
@@ -150,7 +149,7 @@ impl Workflows {
         basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
         client: Arc<dyn WorkerClient>,
-        wft_semaphore: Arc<MeteredSemaphore>,
+        wft_semaphore: Arc<MeteredPermitDealer<WorkflowSlotKind>>,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         local_activity_request_sink: impl LocalActivityRequestSink,
         local_act_mgr: Arc<LocalActivityManager>,
@@ -223,9 +222,11 @@ impl Workflows {
                                         .expect("Activation processor channel not dropped");
                                 }
                             }
-                            Err(e) => activation_tx
-                                .send(Err(e))
-                                .expect("Activation processor channel not dropped"),
+                            Err(e) => {
+                                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
+                                    error!(activation=?e.0, "Activation processor channel dropped");
+                                });
+                            }
                         }
                     }
                 });
@@ -267,33 +268,41 @@ impl Workflows {
                     break Ok(act);
                 }
                 ActivationOrAuto::Autocomplete { run_id } => {
-                    self.activation_completed(
-                        WorkflowActivationCompletion {
-                            run_id,
-                            status: Some(
-                                workflow_completion::Success::from_variants(vec![]).into(),
-                            ),
-                        },
-                        true,
-                        // We need to say a type, but the type is irrelevant, so imagine some
-                        // boxed function we'll never call.
-                        Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                    )
-                    .await?;
+                    if let Err(e) = self
+                        .activation_completed(
+                            WorkflowActivationCompletion {
+                                run_id,
+                                status: Some(
+                                    workflow_completion::Success::from_variants(vec![]).into(),
+                                ),
+                            },
+                            true,
+                            // We need to say a type, but the type is irrelevant, so imagine some
+                            // boxed function we'll never call.
+                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                        )
+                        .await
+                    {
+                        error!(error=?e, "Error while auto-completing workflow task");
+                    }
                 }
                 ActivationOrAuto::AutoFail {
                     run_id,
                     machines_err,
                 } => {
-                    self.activation_completed(
-                        WorkflowActivationCompletion {
-                            run_id,
-                            status: Some(machines_err.as_failure().into()),
-                        },
-                        true,
-                        Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                    )
-                    .await?;
+                    if let Err(e) = self
+                        .activation_completed(
+                            WorkflowActivationCompletion {
+                                run_id,
+                                status: Some(machines_err.as_failure().into()),
+                            },
+                            true,
+                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                        )
+                        .await
+                    {
+                        error!(error=?e, "Error while auto-failing workflow task");
+                    }
                 }
             }
         }
@@ -510,11 +519,11 @@ impl Workflows {
         async move { rx.await.ok() }
     }
 
-    pub(super) fn available_wft_permits(&self) -> usize {
+    pub(super) fn available_wft_permits(&self) -> Option<usize> {
         self.wft_semaphore.available_permits()
     }
     #[cfg(test)]
-    pub(super) fn unused_wft_permits(&self) -> usize {
+    pub(super) fn unused_wft_permits(&self) -> Option<usize> {
         self.wft_semaphore.unused_permits()
     }
 
@@ -613,7 +622,7 @@ impl Workflows {
     /// Process eagerly returned activities from WFT completion
     fn handle_eager_activities(
         &self,
-        reserved_act_permits: Vec<TrackedOwnedMeteredSemPermit>,
+        reserved_act_permits: Vec<TrackedOwnedMeteredSemPermit<ActivitySlotKind>>,
         eager_acts: Vec<PollActivityTaskQueueResponse>,
     ) {
         if let Some(at_handle) = self.activity_tasks_handle.as_ref() {
@@ -657,7 +666,7 @@ impl Workflows {
     fn reserve_activity_slots_for_outgoing_commands(
         &self,
         commands: &mut [Command],
-    ) -> Vec<TrackedOwnedMeteredSemPermit> {
+    ) -> Vec<TrackedOwnedMeteredSemPermit<ActivitySlotKind>> {
         let mut reserved = vec![];
         for cmd in commands {
             if let Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs)) =
@@ -711,10 +720,7 @@ impl Workflows {
 /// Returned when a cache miss happens and we need to fetch history from the beginning to
 /// replay a run
 #[derive(Debug, derive_more::Display)]
-#[display(
-    fmt = "CacheMissFetchReq(run_id: {})",
-    "original_wft.work.execution.run_id"
-)]
+#[display("CacheMissFetchReq(run_id: {})", "original_wft.work.execution.run_id")]
 #[must_use]
 struct CacheMissFetchReq {
     original_wft: PermittedWFT,
@@ -740,11 +746,11 @@ enum ActivationOrAuto {
     /// This type should only be filled with an empty activation which is ready to have queries
     /// inserted into the joblist
     ReadyForQueries(WorkflowActivation),
-    #[display(fmt = "Autocomplete(run_id={run_id})")]
+    #[display("Autocomplete(run_id={run_id})")]
     Autocomplete {
         run_id: String,
     },
-    #[display(fmt = "AutoFail(run_id={run_id})")]
+    #[display("AutoFail(run_id={run_id})")]
     AutoFail {
         run_id: String,
         machines_err: WFMachinesError,
@@ -753,11 +759,11 @@ enum ActivationOrAuto {
 
 /// A WFT which is considered to be using a slot for metrics purposes and being or about to be
 /// applied to workflow state.
-#[derive(derive_more::DebugCustom)]
-#[debug(fmt = "PermittedWft({work:?})")]
+#[derive(derive_more::Debug)]
+#[debug("PermittedWft({work:?})")]
 pub(crate) struct PermittedWFT {
     work: PreparedWFT,
-    permit: UsedMeteredSemPermit,
+    permit: UsedMeteredSemPermit<WorkflowSlotKind>,
     paginator: HistoryPaginator,
 }
 /// A WFT without a permit
@@ -793,6 +799,18 @@ impl PreparedWFT {
         let no_new_history = self.update.wft_started_id == 0;
         no_new_history && self.legacy_query.is_some()
     }
+
+    /// Useful for showing detailed info on incoming WFTs
+    #[allow(dead_code)]
+    fn print_details(&self) -> String {
+        format!(
+            "WFT events: [{}], messages: {:?}, legacy_query: {:?}, queries: {:?}",
+            self.update.get_events().iter().format(", "),
+            &self.messages,
+            &self.legacy_query,
+            &self.query_requests
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -803,7 +821,7 @@ struct OutstandingTask {
     start_time: Instant,
     /// The WFT permit owned by this task, ensures we don't exceed max concurrent WFT, and makes
     /// sure the permit is automatically freed when we delete the task.
-    permit: UsedMeteredSemPermit,
+    permit: UsedMeteredSemPermit<WorkflowSlotKind>,
 }
 
 impl OutstandingTask {
@@ -1020,7 +1038,7 @@ fn validate_completion(
     match completion.status {
         Some(workflow_activation_completion::Status::Successful(success)) => {
             // Convert to wf commands
-            let mut commands = success
+            let commands = success
                 .commands
                 .into_iter()
                 .map(|c| c.try_into())
@@ -1045,16 +1063,6 @@ fn validate_completion(
                     ),
                     run_id: completion.run_id,
                 });
-            }
-
-            // Any non-query-response commands after a terminal command should be ignored
-            if let Some(term_cmd_pos) = commands.iter().position(|c| c.is_terminal()) {
-                // Query responses are just fine, so keep them.
-                let queries = commands
-                    .split_off(term_cmd_pos + 1)
-                    .into_iter()
-                    .filter(|c| matches!(c, WFCommand::QueryResponse(_)));
-                commands.extend(queries);
             }
 
             Ok(ValidatedCompletion::Success {
@@ -1234,19 +1242,13 @@ struct WorkflowStartedInfo {
 
 /// Wraps outgoing activation job protos with some internal details core might care about
 #[derive(Debug, derive_more::Display)]
-#[display(fmt = "{variant}")]
+#[display("{variant}")]
 struct OutgoingJob {
     variant: workflow_activation_job::Variant,
-    /// Since LA resolutions are not distinguished from non-LA resolutions as far as lang is
-    /// concerned, but core cares about that sometimes, attach that info here.
-    is_la_resolution: bool,
 }
 impl<WA: Into<workflow_activation_job::Variant>> From<WA> for OutgoingJob {
     fn from(wa: WA) -> Self {
-        Self {
-            variant: wa.into(),
-            is_la_resolution: false,
-        }
+        Self { variant: wa.into() }
     }
 }
 impl From<OutgoingJob> for WorkflowActivationJob {
@@ -1320,8 +1322,17 @@ impl LocalActivityRequestSink for LAReqSink {
 /// Sorts jobs in an activation to be in the order lang expects, and confirms any invariants
 /// activations must uphold.
 ///
-/// ## Ordering
-/// `patches -> signals/updates -> other -> queries -> evictions`
+/// ## Job Ordering
+/// 1. init workflow
+/// 2. patches
+/// 3. random-seed-updates
+/// 4. signals/updates
+/// 5. all others
+/// 6. local activity resolutions
+/// 7. queries
+/// 8. evictions
+///
+/// See the [WorkflowActivation] docstring for more detail
 ///
 /// ## Invariants:
 /// * Queries always go in their own activation
@@ -1348,26 +1359,26 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
         // Unwrapping is fine here since we'll never issue empty variants
         let j1v = j1.variant.as_ref().unwrap();
         let j2v = j2.variant.as_ref().unwrap();
-        if discriminant(j1v) == discriminant(j2v) {
-            return Ordering::Equal;
-        }
         fn variant_ordinal(v: &workflow_activation_job::Variant) -> u8 {
             match v {
+                workflow_activation_job::Variant::InitializeWorkflow(_) => 0,
                 workflow_activation_job::Variant::NotifyHasPatch(_) => 1,
-                workflow_activation_job::Variant::SignalWorkflow(_) => 2,
-                workflow_activation_job::Variant::DoUpdate(_) => 2,
+                workflow_activation_job::Variant::UpdateRandomSeed(_) => 2,
+                workflow_activation_job::Variant::SignalWorkflow(_) => 3,
+                workflow_activation_job::Variant::DoUpdate(_) => 3,
+                workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.
-                workflow_activation_job::Variant::QueryWorkflow(_) => 4,
+                workflow_activation_job::Variant::QueryWorkflow(_) => 6,
                 // Also shouldn't ever end up anywhere but the end by construction, but no harm in
                 // double-checking.
-                workflow_activation_job::Variant::RemoveFromCache(_) => 5,
-                _ => 3,
+                workflow_activation_job::Variant::RemoveFromCache(_) => 7,
+                _ => 4,
             }
         }
         variant_ordinal(j1v).cmp(&variant_ordinal(j2v))
-    })
+    });
 }
 
 #[cfg(test)]
@@ -1409,6 +1420,11 @@ mod tests {
                     )),
                 },
                 WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::UpdateRandomSeed(
+                        Default::default(),
+                    )),
+                },
+                WorkflowActivationJob {
                     variant: Some(workflow_activation_job::Variant::SignalWorkflow(
                         SignalWorkflow {
                             signal_name: "2".to_string(),
@@ -1429,6 +1445,7 @@ mod tests {
             variants.as_slice(),
             &[
                 workflow_activation_job::Variant::NotifyHasPatch(_),
+                workflow_activation_job::Variant::UpdateRandomSeed(_),
                 workflow_activation_job::Variant::SignalWorkflow(ref s1),
                 workflow_activation_job::Variant::DoUpdate(_),
                 workflow_activation_job::Variant::SignalWorkflow(ref s2),

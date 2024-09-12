@@ -19,7 +19,7 @@ use temporal_sdk_core_protos::{
         common::v1::WorkflowExecution as UpstreamWE,
         enums::v1::{CommandType, EventType, SignalExternalWorkflowExecutionFailedCause},
         failure::v1::{failure::FailureInfo, ApplicationFailureInfo, CanceledFailureInfo, Failure},
-        history::v1::{history_event, HistoryEvent},
+        history::v1::history_event,
     },
 };
 
@@ -60,7 +60,7 @@ pub(super) struct SharedState {
 #[derive(Debug, derive_more::Display)]
 pub(super) enum SignalExternalCommand {
     Signaled,
-    #[display(fmt = "Failed")]
+    #[display("Failed")]
     Failed(SignalExternalWorkflowExecutionFailedCause),
     Cancelled,
 }
@@ -112,6 +112,7 @@ pub(super) fn new_external_signal(
     let cmd = Command {
         command_type: CommandType::SignalExternalWorkflowExecution as i32,
         attributes: Some(cmd_attrs),
+        user_metadata: Default::default(),
     };
     Ok(NewMachineWithCommand {
         command: cmd,
@@ -259,15 +260,6 @@ impl WFMachinesAdapter for SignalExternalMachine {
                 panic!("Cancelled command not expected as part of non-cancel transition")
             }
         })
-    }
-
-    fn matches_event(&self, event: &HistoryEvent) -> bool {
-        matches!(
-            event.event_type(),
-            EventType::ExternalWorkflowExecutionSignaled
-                | EventType::SignalExternalWorkflowExecutionInitiated
-                | EventType::SignalExternalWorkflowExecutionFailed
-        )
     }
 }
 
