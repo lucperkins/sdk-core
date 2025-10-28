@@ -5,37 +5,30 @@
 
   # Flake inputs
   inputs = {
-    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.2405.*";
+    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
 
     rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+      url = "https://flakehub.com/f/oxalica/rust-overlay/0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-
-    flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/*";
-
-    flake-schemas.url = "https://flakehub.com/f/DeterminateSystems/flake-schemas/*";
   };
 
   # Flake outputs that other flakes can use
-  outputs = { self, nixpkgs, rust-overlay, flake-compat, flake-schemas }:
+  outputs = { self, ... }@inputs:
     let
       # Helpers for producing system-specific outputs
       supportedSystems = [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" "aarch64-linux" ];
-      forEachSupportedSystem = f: nixpkgs.lib.genAttrs supportedSystems (system: f {
-        pkgs = import nixpkgs {
+      forEachSupportedSystem = f: inputs.nixpkgs.lib.genAttrs supportedSystems (system: f {
+        pkgs = import inputs.nixpkgs {
           inherit system;
           overlays = [
-            rust-overlay.overlays.default
+            inputs.rust-overlay.overlays.default
             self.overlays.default
           ];
         };
       });
     in
     {
-      # Schemas tell Nix about the structure of your flake's outputs
-      inherit (flake-schemas) schemas;
-
       # Add custom attributes to Nixpkgs
       overlays.default = final: prev: {
         rustToolchain = final.rust-bin.nightly.latest.default.override { extensions = [ "rust-src" ]; };
