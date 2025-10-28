@@ -7,12 +7,19 @@ Cargo.lock
 /.idea/
 *.iml
 *~
+.aider*
 
 # Ignore generated protobuf files
 src/protos/*.rs
 !src/protos/mod.rs
+
+# Coverage
 /tarpaulin-report.html
 /machine_coverage/
 /bindings/
 /core/machine_coverage/
+
+# Keep secrets here
 /.cloud_certs/
+cloud_envs.fish
+/.claude/settings.local.json

@@ -1,5 +1,12 @@
 [workspace]
-members = ["core", "client", "core-api", "fsm", "test-utils", "sdk-core-protos", "sdk"]
+members = [
+    "crates/sdk-core",
+    "crates/client",
+    "crates/common",
+    "crates/macros",
+    "crates/sdk",
+    "crates/sdk-core-c-bridge",
+]
 resolver = "2"
 
 [workspace.package]
@@ -8,13 +15,28 @@ license-file = "LICENSE.txt"
 
 [workspace.dependencies]
 derive_builder = "0.20"
-derive_more = { version = "1.0", features = ["constructor", "display", "from", "into", "debug"] }
-once_cell = "1.16"
-tonic = "0.12"
-tonic-build = "0.12"
-opentelemetry = { version = "0.24", features = ["metrics"] }
-prost = "0.13"
-prost-types = "0.13"
+derive_more = { version = "2.0", features = [
+    "constructor",
+    "display",
+    "from",
+    "into",
+    "debug",
+    "try_into",
+] }
+thiserror = "2"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+opentelemetry = { version = "0.31", features = ["metrics"] }
+prost = "0.14"
+prost-types = { version = "0.7", package = "prost-wkt-types" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+[profile.release-lto]
+inherits = "release"
+lto = true
